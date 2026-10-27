@@ -74,16 +74,23 @@ func TestParseLog(t *testing.T) {
 
 func TestParseLocation(t *testing.T) {
 	cases := map[string]Location{
-		"^/trunk":                     {KindTrunk, "trunk"},
-		"^/proj/trunk/src":            {KindTrunk, "trunk"},
-		"^/proj/branches/feature-x/a": {KindBranch, "feature-x"},
-		"^/tags/v1.0":                 {KindTag, "v1.0"},
-		"^/random/path":               {KindOther, "/random/path"},
+		"^/trunk":                     {KindTrunk, "trunk", "^", ""},
+		"^/proj/trunk/src":            {KindTrunk, "trunk", "^/proj", "/src"},
+		"^/proj/branches/feature-x/a": {KindBranch, "feature-x", "^/proj", "/a"},
+		"^/tags/v1.0":                 {KindTag, "v1.0", "^", ""},
+		"^/random/path":               {KindOther, "/random/path", "", ""},
 	}
 	for in, want := range cases {
 		if got := ParseLocation(in); got != want {
 			t.Errorf("ParseLocation(%q) = %+v, want %+v", in, got, want)
 		}
+	}
+	loc := ParseLocation("^/proj/trunk")
+	if got := loc.BranchURL(KindBranch, "x"); got != "^/proj/branches/x" {
+		t.Errorf("BranchURL = %q", got)
+	}
+	if got := ParseLocation("^/trunk").BranchURL(KindTag, "v1"); got != "^/tags/v1" {
+		t.Errorf("BranchURL = %q", got)
 	}
 }
 

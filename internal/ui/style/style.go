@@ -2,6 +2,7 @@
 package style
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -26,6 +27,7 @@ var (
 	Title     = lipgloss.NewStyle().Foreground(Accent).Bold(true)
 	ErrorText = lipgloss.NewStyle().Foreground(Red)
 	Key       = lipgloss.NewStyle().Foreground(Accent)
+	Current   = lipgloss.NewStyle().Foreground(Yellow).Bold(true).Underline(true)
 )
 
 // ItemStyle colours a status code.
@@ -46,10 +48,9 @@ func ItemStyle(f svn.FileStatus) lipgloss.Style {
 	return s.Foreground(Magenta)
 }
 
-// DiffLine renders one diff line in colour.
-func DiffLine(l svn.DiffLine) string {
+func diffStyle(k svn.LineKind) lipgloss.Style {
 	s := lipgloss.NewStyle()
-	switch l.Kind {
+	switch k {
 	case svn.LineAdded:
 		s = s.Foreground(Green)
 	case svn.LineRemoved:
@@ -59,7 +60,38 @@ func DiffLine(l svn.DiffLine) string {
 	case svn.LineHeader:
 		s = s.Bold(true)
 	}
-	return s.Render(ExpandTabs(l.Text))
+	return s
+}
+
+// DiffLine renders one diff line in colour.
+func DiffLine(l svn.DiffLine) string {
+	return diffStyle(l.Kind).Render(ExpandTabs(l.Text))
+}
+
+// Match is the highlight for search hits.
+var Match = lipgloss.NewStyle().Background(Yellow).Foreground(lipgloss.Color("#000000"))
+
+// DiffLineHighlight renders l like DiffLine with every match of re
+// highlighted; current marks the line holding the selected match.
+func DiffLineHighlight(l svn.DiffLine, re *regexp.Regexp, current bool) string {
+	text := ExpandTabs(l.Text)
+	base := diffStyle(l.Kind)
+	hit := Match
+	if current {
+		hit = hit.Bold(true).Underline(true)
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range re.FindAllStringIndex(text, -1) {
+		if loc[0] == loc[1] {
+			continue
+		}
+		b.WriteString(base.Render(text[last:loc[0]]))
+		b.WriteString(hit.Render(text[loc[0]:loc[1]]))
+		last = loc[1]
+	}
+	b.WriteString(base.Render(text[last:]))
+	return b.String()
 }
 
 // ExpandTabs replaces tabs with four spaces so widths are predictable.

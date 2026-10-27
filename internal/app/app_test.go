@@ -53,6 +53,7 @@ func setup(t *testing.T) (*Model, string) {
 	}
 	m := New(client)
 	m.refreshEvery = 0
+	m.backupRoot = filepath.Join(root, "backups")
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	drain(t, m, m.Init())
 	return m, url + "/trunk"
@@ -184,7 +185,7 @@ func TestUpdateBehindHead(t *testing.T) {
 
 func TestLogPanelShowsRevision(t *testing.T) {
 	m, _ := setup(t)
-	press(t, m, "3")
+	press(t, m, "4")
 	assertScreen(t, m, "Revision r2", "Author:", "A /trunk/a.txt", "+one")
 	press(t, m, "?")
 	assertScreen(t, m, "Keybindings")
@@ -218,7 +219,7 @@ func setupConflict(t *testing.T) *Model {
 			t.Fatalf("conflict artifact %s should be hidden", f.Path)
 		}
 	}
-	press(t, m, "g") // the cursor stays on a.txt across refreshes; go to the conflict
+	selectFile(t, m, "f.txt")
 	return m
 }
 

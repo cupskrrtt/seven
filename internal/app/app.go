@@ -1,12 +1,15 @@
 // Package app is the Bubble Tea root model: panel layout, focus and keys.
+// Each panel's keys and rendering live in its own file.
 package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -25,13 +28,13 @@ type panel int
 const (
 	panelStatus panel = iota
 	panelFiles
+	panelBranches
 	panelLog
 	panelMain
 )
 
-var panelNames = map[panel]string{
-	panelStatus: "Status", panelFiles: "Files", panelLog: "Log", panelMain: "Main",
-}
+// leftPanels is the tab order of the left column.
+var leftPanels = []panel{panelStatus, panelFiles, panelBranches, panelLog}
 
 const defaultRefresh = 10 * time.Second
 
@@ -44,15 +47,29 @@ type Model struct {
 	info *svn.Info
 	head int
 
-	files    []svn.FileStatus
-	selected map[string]bool
-	fileList list
+	files     []svn.FileStatus
+	selected  map[string]bool
+	fileList  list      // cursor over fileRows
+	fileRows  []fileRow // visible tree (or flat) rows
+	collapsed map[string]bool
+	flatFiles bool // show a flat list instead of the tree
+
+	branches        []svn.Branch
+	branchList      list
+	branchErr       string
+	branchesLoading bool
+	branchesStale   bool
 
 	revs       []svn.Revision
 	logList    list
 	logLoading bool
 	logDone    bool
 	logStale   bool
+	logGen     int            // bumped whenever target/filters change
+	logTarget  string         // URL being logged; "" means the working copy's URL
+	logLabel   string         // branch name when logTarget is set
+	logPath    string         // working-copy relative path filter
+	logOpts    svn.LogOptions // search / range / stop-on-copy (Limit and paging set per request)
 
 	focus    panel
 	lastLeft panel // left panel the main view belongs to
@@ -60,14 +77,30 @@ type Model struct {
 	mainKey     string
 	mainTitle   string
 	mainLines   []string
-	mainScroll  int
+	mainRaw     []svn.DiffLine
+	mainFile    string // file whose diff is shown; enables hunk revert
+	mainHunks   []svn.DiffHunk
+	mainHunk    int // selected hunk, -1 for none
+	mainScroll  int // index into mainVisible
 	mainHScroll int
 
+	mainSections  []diffSection // per-file sections of a multi-file diff
+	mainSectionOf []int         // raw line → section, -1 before the first file
+	mainFolded    map[int]bool  // folded sections
+	mainCurFile   int           // section that z / } / { act on, -1 if none
+	mainVisible   []int         // raw lines shown after folding
+	mainSearch    string
+	mainSearchRe  *regexp.Regexp
+	mainMatches   []int // raw lines matching the search
+	mainMatch     int   // current match, -1 for none
+
 	conflict *conflictView // non-nil while the hunk picker owns the main view
+	blame    *blameView    // non-nil while blame owns the main view
 
 	ignoreWhitespace bool
 	showCmdLog       bool
 	refreshEvery     time.Duration // status auto-refresh; 0 disables
+	backupRoot       string        // overrides the backup directory (tests)
 
 	popup  popup
 	status string
@@ -78,12 +111,15 @@ type Model struct {
 // New returns a model for the working copy client points at.
 func New(client *svn.Client) *Model {
 	return &Model{
-		client:       client,
-		selected:     map[string]bool{},
-		focus:        panelFiles,
-		lastLeft:     panelFiles,
-		logStale:     true,
-		refreshEvery: defaultRefresh,
+		client:        client,
+		selected:      map[string]bool{},
+		collapsed:     map[string]bool{},
+		focus:         panelFiles,
+		lastLeft:      panelFiles,
+		logStale:      true,
+		branchesStale: true,
+		mainHunk:      -1,
+		refreshEvery:  defaultRefresh,
 	}
 }
 
@@ -100,7 +136,15 @@ func (m *Model) tick() tea.Cmd {
 
 func (m *Model) refresh() tea.Cmd {
 	m.logStale = true
+	m.branchesStale = true
 	return tea.Batch(m.loadInfo(), m.loadStatus())
+}
+
+func (m *Model) location() svn.Location {
+	if m.info == nil {
+		return svn.Location{}
+	}
+	return svn.ParseLocation(m.info.RelativeURL)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -116,20 +160,46 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.loadStatus(), m.tick())
 
 	case infoMsg:
+		prev := m.location()
 		urlChanged := m.info == nil || m.info.URL != msg.info.URL
 		m.info, m.head = msg.info, msg.head
+		var cmds []tea.Cmd
+		if urlChanged {
+			// Switched branch: the log follows the working copy again.
+			m.logTarget, m.logLabel = "", ""
+		}
 		if m.logStale || urlChanged {
 			m.logStale = false
-			m.logLoading = true
-			return m, m.loadLog(m.info.URL, 0)
+			cmds = append(cmds, m.reloadLog())
 		}
-		return m, nil
+		if loc := m.location(); m.branchesStale || loc.Root != prev.Root {
+			m.branchesStale = false
+			if loc.HasLayout() {
+				m.branchesLoading = true
+				cmds = append(cmds, m.loadBranches(loc))
+			} else {
+				m.branches, m.branchErr = nil, "No trunk/branches/tags layout found."
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case statusMsg:
 		m.applyStatus(msg.files)
 		return m, m.syncMain()
 
+	case branchesMsg:
+		m.branchesLoading = false
+		m.branches, m.branchErr = msg.branches, ""
+		if msg.err != nil {
+			m.branchErr = msg.err.Error()
+		}
+		m.branchList.set(m.branchList.cursor, len(m.branches))
+		return m, m.syncMain()
+
 	case logMsg:
+		if msg.gen != m.logGen {
+			return m, nil // filters changed while this page was loading
+		}
 		m.logLoading = false
 		if msg.append {
 			m.revs = append(m.revs, msg.revs...)
@@ -142,23 +212,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case diffMsg:
 		if msg.key == m.mainKey {
-			m.setMain(msg.text)
+			m.setMainDiff(msg.text, msg.file)
 		}
 		return m, nil
+
+	case blameMsg:
+		if m.blame != nil && m.blame.path == msg.path {
+			m.blame.lines = msg.lines
+			m.blame.loading = false
+		}
+		return m, nil
+
+	case revisionMsg:
+		return m, m.showRevision(msg.rev)
 
 	case opDoneMsg:
 		m.status = msg.status
 		if m.conflict != nil {
 			m.reloadConflict() // e.g. after editing the file in $EDITOR
 		}
+		m.mainKey = "" // whatever is shown may have changed
 		return m, m.refresh()
 
 	case errMsg:
 		m.logLoading = false
 		m.status = ""
 		text := msg.err.Error()
-		if svn.IsOutOfDate(msg.err) {
-			text += "\n\nThe working copy is out of date. Press 'u' to update, then commit again."
+		switch {
+		case svn.IsOutOfDate(msg.err):
+			text += "\n\nThe working copy is out of date. Press 'u' to update, then try again."
+		case svn.IsMixedRevision(msg.err):
+			text += "\n\nThe working copy has mixed revisions. Press 'u' to update, then merge again."
+		case errors.Is(msg.err, svn.ErrPatchRejected):
+			text += "\n\nThe file was left unchanged where the hunk did not apply."
 		}
 		m.popup = &messagePopup{heading: "Error", text: text, isError: true}
 		return m, m.loadStatus()
@@ -191,129 +277,47 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// applyStatus replaces the file list, keeping the cursor on the same path
-// and dropping selections of paths that no longer have changes.
-func (m *Model) applyStatus(files []svn.FileStatus) {
-	var current string
-	if f, ok := m.currentFile(); ok {
-		current = f.Path
-	}
-	m.files = files
-	present := map[string]bool{}
-	cursor := min(m.fileList.cursor, max(0, len(files)-1))
-	for i, f := range files {
-		present[f.Path] = true
-		if f.Path == current {
-			cursor = i
-		}
-	}
-	for p := range m.selected {
-		if !present[p] {
-			delete(m.selected, p)
-		}
-	}
-	m.fileList.set(cursor, len(files))
-}
-
-func (m *Model) currentFile() (svn.FileStatus, bool) {
-	if m.fileList.cursor < len(m.files) {
-		return m.files[m.fileList.cursor], true
-	}
-	return svn.FileStatus{}, false
-}
-
-func (m *Model) currentRev() (svn.Revision, bool) {
-	if m.logList.cursor < len(m.revs) {
-		return m.revs[m.logList.cursor], true
-	}
-	return svn.Revision{}, false
-}
-
-// syncMain loads whatever the main view should show for the current
-// left-panel selection, skipping the load if it is already shown.
-func (m *Model) syncMain() tea.Cmd {
-	switch m.lastLeft {
-	case panelFiles:
-		f, ok := m.currentFile()
-		if !ok {
-			m.mainKey, m.mainTitle = "", "Diff"
-			m.setMain("Working copy is clean.")
-			return nil
-		}
-		key := f.Path
-		if key == m.mainKey {
-			return nil
-		}
-		m.mainKey, m.mainTitle = key, "Diff · "+f.Path
-		m.setMain("Loading…")
-		return m.loadFileDiff(f)
-	case panelLog:
-		r, ok := m.currentRev()
-		if !ok || m.info == nil {
-			return nil
-		}
-		key := fmt.Sprintf("r%d", r.Number)
-		if key == m.mainKey {
-			return nil
-		}
-		m.mainKey, m.mainTitle = key, fmt.Sprintf("Revision r%d", r.Number)
-		m.setMain("Loading…")
-		return m.loadRevisionDiff(r, m.info.RepoRoot)
-	case panelStatus:
-		m.mainKey, m.mainTitle = "status", "Status"
-		m.setMain(m.statusDetail())
-	}
-	return nil
-}
-
-func (m *Model) setMain(text string) {
-	lines := svn.ParseDiff(text)
-	m.mainLines = make([]string, len(lines))
-	for i, l := range lines {
-		m.mainLines[i] = style.DiffLine(l)
-	}
-	m.mainScroll, m.mainHScroll = 0, 0
-}
-
-func (m *Model) statusDetail() string {
-	if m.info == nil {
-		return "Loading…"
-	}
-	i := m.info
-	head := "unknown (offline?)"
-	if m.head > 0 {
-		head = "r" + strconv.Itoa(m.head)
-	}
-	return fmt.Sprintf("Working copy: %s\nURL:          %s\nRepository:   %s\nUUID:         %s\n"+
-		"Location:     %s\nBASE:         r%d\nHEAD:         %s\nLast change:  r%d by %s\n\n"+
-		"Press 'u' to update, '?' for all keybindings.",
-		i.WCRoot, i.URL, i.RepoRoot, i.RepoUUID, svn.ParseLocation(i.RelativeURL),
-		i.Revision, head, i.LastChanged, i.Author)
-}
-
 func (m *Model) setFocus(p panel) tea.Cmd {
 	m.focus = p
 	if p != panelMain {
 		m.lastLeft = p
-		if m.conflict != nil {
-			m.conflict = nil
-			m.mainKey = "" // the file changed; reload its diff
+		if m.conflict != nil || m.blame != nil {
+			m.conflict, m.blame = nil, nil
+			m.mainKey = "" // reload whatever the panel shows
 		}
 	}
 	return m.syncMain()
 }
 
+func (m *Model) cycleFocus(step int) tea.Cmd {
+	for i, p := range leftPanels {
+		if p == m.lastLeft {
+			return m.setFocus(leftPanels[(i+step+len(leftPanels))%len(leftPanels)])
+		}
+	}
+	return m.setFocus(panelFiles)
+}
+
 func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	key := k.String()
 
-	// The conflict picker takes precedence over global keys except quit/help.
-	if m.focus == panelMain && m.conflict != nil && key != "q" && key != "ctrl+c" && key != "?" {
-		if handled, cmd := m.handleConflictKey(key); handled {
-			return cmd
+	// Main-view modes take precedence over global keys except quit/help.
+	if m.focus == panelMain && key != "q" && key != "ctrl+c" && key != "?" {
+		if m.conflict != nil {
+			if handled, cmd := m.handleConflictKey(key); handled {
+				return cmd
+			}
+		} else if m.blame != nil {
+			if handled, cmd := m.handleBlameKey(key); handled {
+				return cmd
+			}
 		}
 	}
+	// Panel keys that shadow global ones.
+	if m.focus == panelLog && key == "U" {
+		return m.logUpdateMenu()
+	}
 
-	// Global keys.
 	switch key {
 	case "q", "ctrl+c":
 		return tea.Quit
@@ -333,29 +337,27 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 		})
 	case "U":
 		m.popup = newInputPopup("Update to revision", []string{"Revision"}, nil, func(v []string) tea.Cmd {
-			rev, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(v[0]), "r"))
-			if err != nil || rev <= 0 {
-				return func() tea.Msg { return errMsg{fmt.Errorf("invalid revision %q", v[0])} }
+			rev, err := parseRev(v[0])
+			if err != nil {
+				return errCmd(err)
 			}
 			m.status = fmt.Sprintf("Updating to r%d…", rev)
 			return m.op(func(ctx context.Context) (string, error) { return m.updateTo(ctx, rev) })
 		})
 		return nil
 	case "tab":
-		return m.setFocus([]panel{panelFiles, panelLog, panelStatus}[m.lastLeft])
+		return m.cycleFocus(1)
 	case "shift+tab":
-		return m.setFocus([]panel{panelLog, panelStatus, panelFiles}[m.lastLeft])
-	case "1":
-		return m.setFocus(panelStatus)
-	case "2":
-		return m.setFocus(panelFiles)
-	case "3":
-		return m.setFocus(panelLog)
+		return m.cycleFocus(-1)
+	case "1", "2", "3", "4":
+		return m.setFocus(leftPanels[key[0]-'1'])
 	}
 
 	switch m.focus {
 	case panelFiles:
 		return m.handleFilesKey(key)
+	case panelBranches:
+		return m.handleBranchesKey(key)
 	case panelLog:
 		return m.handleLogKey(key)
 	case panelMain:
@@ -368,171 +370,15 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *Model) handleFilesKey(key string) tea.Cmd {
-	f, ok := m.currentFile()
-	switch key {
-	case "j", "down":
-		m.fileList.move(1, len(m.files))
-		return m.syncMain()
-	case "k", "up":
-		m.fileList.move(-1, len(m.files))
-		return m.syncMain()
-	case "g", "home":
-		m.fileList.set(0, len(m.files))
-		return m.syncMain()
-	case "G", "end":
-		m.fileList.set(len(m.files)-1, len(m.files))
-		return m.syncMain()
-	case "enter":
-		if ok && f.Item == svn.ItemConflicted {
-			return m.openConflict(f)
-		}
-		if ok {
-			return m.setFocus(panelMain)
-		}
-	case "w":
-		m.ignoreWhitespace = !m.ignoreWhitespace
-		m.mainKey = ""
-		return m.syncMain()
-	case "c":
-		return m.startCommit(false)
-	case "C":
-		return m.startCommit(true)
-	}
-	if !ok {
-		return nil
-	}
+func errCmd(err error) tea.Cmd { return func() tea.Msg { return errMsg{err} } }
 
-	switch key {
-	case " ":
-		if m.selected[f.Path] {
-			delete(m.selected, f.Path)
-		} else {
-			m.selected[f.Path] = true
-		}
-		m.fileList.move(1, len(m.files))
-		return m.syncMain()
-	case "A":
-		// Toggle selection of all versioned changes.
-		all := len(m.selected) == 0
-		m.selected = map[string]bool{}
-		if all {
-			for _, f := range m.files {
-				if f.Versioned() {
-					m.selected[f.Path] = true
-				}
-			}
-		}
-	case "a":
-		if f.Item != svn.ItemUnversioned {
-			m.status = f.Path + " is already versioned"
-			return nil
-		}
-		return m.op(func(ctx context.Context) (string, error) {
-			return "Added " + f.Path, m.client.Add(ctx, f.Path)
-		})
-	case "d":
-		if f.Item == svn.ItemUnversioned {
-			m.popup = &confirmPopup{
-				heading: "Delete unversioned file",
-				text:    fmt.Sprintf("Permanently delete %s from disk? This cannot be undone.", f.Path),
-				onYes: m.op(func(context.Context) (string, error) {
-					return "Deleted " + f.Path, os.RemoveAll(m.abs(f.Path))
-				}),
-			}
-			return nil
-		}
-		m.popup = &confirmPopup{
-			heading: "Revert",
-			text:    fmt.Sprintf("Discard all local changes to %s?", f.Path),
-			onYes: m.op(func(ctx context.Context) (string, error) {
-				return "Reverted " + f.Path, m.client.Revert(ctx, f.Path)
-			}),
-		}
-	case "D":
-		if !f.Versioned() {
-			m.status = "Use 'd' to delete unversioned files"
-			return nil
-		}
-		m.popup = &confirmPopup{
-			heading: "Schedule deletion",
-			text:    fmt.Sprintf("svn rm %s? The file is removed from disk and deleted on next commit.", f.Path),
-			onYes: m.op(func(ctx context.Context) (string, error) {
-				return "Scheduled " + f.Path + " for deletion", m.client.Remove(ctx, f.Path)
-			}),
-		}
-	case "i":
-		if f.Item != svn.ItemUnversioned {
-			m.status = "Only unversioned files can be ignored"
-			return nil
-		}
-		return m.op(func(ctx context.Context) (string, error) {
-			return "Ignored " + f.Path, m.client.Ignore(ctx, f.Path)
-		})
-	case "R":
-		if !f.Conflicted() {
-			m.status = f.Path + " is not conflicted"
-			return nil
-		}
-		m.resolveMenu(f)
-	case "e":
-		return m.openEditor(m.abs(f.Path))
+// parseRev accepts "42" or "r42".
+func parseRev(s string) (int, error) {
+	rev, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(s), "r"))
+	if err != nil || rev <= 0 {
+		return 0, fmt.Errorf("invalid revision %q", s)
 	}
-	return nil
-}
-
-func (m *Model) handleLogKey(key string) tea.Cmd {
-	switch key {
-	case "j", "down":
-		m.logList.move(1, len(m.revs))
-	case "k", "up":
-		m.logList.move(-1, len(m.revs))
-	case "g", "home":
-		m.logList.set(0, len(m.revs))
-	case "G", "end":
-		m.logList.set(len(m.revs)-1, len(m.revs))
-	case "enter":
-		return m.setFocus(panelMain)
-	default:
-		return nil
-	}
-	cmds := []tea.Cmd{m.syncMain()}
-	// Fetch the next page when nearing the end.
-	if !m.logLoading && !m.logDone && m.logList.cursor >= len(m.revs)-10 && len(m.revs) > 0 && m.info != nil {
-		if next := m.revs[len(m.revs)-1].Number - 1; next > 0 {
-			m.logLoading = true
-			cmds = append(cmds, m.loadLog(m.info.URL, next))
-		} else {
-			m.logDone = true
-		}
-	}
-	return tea.Batch(cmds...)
-}
-
-func (m *Model) handleMainKey(key string) tea.Cmd {
-	page := max(1, m.mainHeight()-2)
-	switch key {
-	case "j", "down":
-		m.mainScroll++
-	case "k", "up":
-		m.mainScroll--
-	case "ctrl+d", "pgdown", " ":
-		m.mainScroll += page / 2
-	case "ctrl+u", "pgup":
-		m.mainScroll -= page / 2
-	case "g", "home":
-		m.mainScroll = 0
-	case "G", "end":
-		m.mainScroll = len(m.mainLines)
-	case "h", "left":
-		m.mainHScroll = max(0, m.mainHScroll-8)
-	case "l", "right":
-		m.mainHScroll += 8
-	case "esc", "enter":
-		return m.setFocus(m.lastLeft)
-	}
-	m.mainScroll = max(0, min(m.mainScroll, len(m.mainLines)-page))
-	return nil
+	return rev, nil
 }
 
 func (m *Model) abs(p string) string {
@@ -542,68 +388,26 @@ func (m *Model) abs(p string) string {
 	return filepath.Join(m.client.Dir, p)
 }
 
-func (m *Model) updateTo(ctx context.Context, rev int) (string, error) {
-	res, err := m.client.Update(ctx, rev)
-	if err != nil {
-		return "", err
-	}
-	s := fmt.Sprintf("Updated to r%d", res.Revision)
+// describeUpdate summarises an update/switch/merge result for the status bar.
+func describeUpdate(prefix string, res *svn.UpdateResult) string {
+	s := prefix
 	if res.Conflicts > 0 {
 		s += fmt.Sprintf(" — %d conflict(s)! Resolve them in the Files panel", res.Conflicts)
 	}
-	return s, nil
+	return s
 }
 
-// commitTargets returns selected paths, or every versioned change if
-// nothing is selected.
-func (m *Model) commitTargets() []string {
-	var paths []string
-	for _, f := range m.files {
-		if m.selected[f.Path] || (len(m.selected) == 0 && f.Versioned() && f.Item != svn.ItemNormal) {
-			paths = append(paths, f.Path)
-		}
+func (m *Model) updateTo(ctx context.Context, rev int, paths ...string) (string, error) {
+	res, err := m.client.Update(ctx, rev, paths...)
+	if err != nil {
+		return "", err
 	}
-	return paths
+	prefix := fmt.Sprintf("Updated to r%d", res.Revision)
+	if len(paths) > 0 {
+		prefix = fmt.Sprintf("Updated %s to r%d", strings.Join(paths, ", "), res.Revision)
+	}
+	return describeUpdate(prefix, res), nil
 }
-
-func (m *Model) startCommit(useEditor bool) tea.Cmd {
-	paths := m.commitTargets()
-	if len(paths) == 0 {
-		m.status = "Nothing to commit"
-		return nil
-	}
-	for _, p := range paths {
-		for _, f := range m.files {
-			if f.Path == p && f.Conflicted() {
-				m.popup = &messagePopup{heading: "Cannot commit", text: p + " is conflicted. Resolve it first (R).", isError: true}
-				return nil
-			}
-		}
-	}
-	if useEditor {
-		return m.editCommitMessage(paths)
-	}
-	heading := fmt.Sprintf("Commit %d file(s)", len(paths))
-	if len(m.selected) == 0 {
-		heading = fmt.Sprintf("Commit all %d change(s)", len(paths))
-	}
-	m.popup = newCommitPopup(heading, func(msg string) tea.Cmd { return m.commit(msg, paths) })
-	return nil
-}
-
-func (m *Model) commit(message string, paths []string) tea.Cmd {
-	m.status = "Committing…"
-	return m.op(func(ctx context.Context) (string, error) {
-		rev, err := m.client.Commit(ctx, message, paths...)
-		if err != nil {
-			return "", err
-		}
-		// Committed paths drop out of status, which prunes the selection.
-		return fmt.Sprintf("Committed r%d", rev), nil
-	})
-}
-
-const editorTemplate = "\n# Write the commit message above. Lines starting with '#' are ignored.\n# An empty message aborts the commit.\n#\n# Files to commit:\n"
 
 type editorDoneMsg struct {
 	file  string
@@ -640,46 +444,6 @@ func (m *Model) openEditor(path string) tea.Cmd {
 	})
 }
 
-func (m *Model) editCommitMessage(paths []string) tea.Cmd {
-	f, err := os.CreateTemp("", "seven-commit-*.txt")
-	if err != nil {
-		return func() tea.Msg { return errMsg{err} }
-	}
-	var b strings.Builder
-	b.WriteString(editorTemplate)
-	for _, p := range paths {
-		b.WriteString("#   " + p + "\n")
-	}
-	f.WriteString(b.String())
-	f.Close()
-	return tea.ExecProcess(editorCommand(f.Name()), func(err error) tea.Msg {
-		return editorDoneMsg{file: f.Name(), paths: paths, err: err}
-	})
-}
-
-func (m *Model) commitFromEditor(msg editorDoneMsg) tea.Cmd {
-	defer os.Remove(msg.file)
-	if msg.err != nil {
-		return func() tea.Msg { return errMsg{msg.err} }
-	}
-	data, err := os.ReadFile(msg.file)
-	if err != nil {
-		return func() tea.Msg { return errMsg{err} }
-	}
-	var lines []string
-	for _, l := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
-		if !strings.HasPrefix(l, "#") {
-			lines = append(lines, l)
-		}
-	}
-	text := strings.TrimSpace(strings.Join(lines, "\n"))
-	if text == "" {
-		m.status = "Commit aborted: empty message"
-		return nil
-	}
-	return m.commit(text, msg.paths)
-}
-
 // ---- View ----
 
 func (m *Model) leftWidth() int {
@@ -697,34 +461,47 @@ func (m *Model) mainHeight() int {
 	return m.height - 1 - m.cmdLogHeight()
 }
 
+// leftHeights splits the left column; the active panel gets extra room.
+func (m *Model) leftHeights(avail int) (status, files, branches, log int) {
+	status = 4
+	rest := avail - status
+	weights := map[panel]int{panelFiles: 3, panelBranches: 2, panelLog: 3}
+	if _, ok := weights[m.lastLeft]; ok {
+		weights[m.lastLeft] += 3
+	}
+	total := weights[panelFiles] + weights[panelBranches] + weights[panelLog]
+	files = max(3, rest*weights[panelFiles]/total)
+	branches = max(3, rest*weights[panelBranches]/total)
+	log = rest - files - branches
+	return
+}
+
 func (m *Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
-	if m.width < 50 || m.height < 12 {
+	if m.width < 50 || m.height < 16 {
 		return "Terminal too small for seven."
 	}
 	lw := m.leftWidth()
 	rw := m.width - lw
-	avail := m.height - 1
-
-	statusH := 4
-	rest := avail - statusH
-	filesH := rest * 55 / 100
-	if m.focus == panelLog || (m.focus == panelMain && m.lastLeft == panelLog) {
-		filesH = rest * 35 / 100
-	}
-	logH := rest - filesH
+	statusH, filesH, branchesH, logH := m.leftHeights(m.height - 1)
 
 	left := lipgloss.JoinVertical(lipgloss.Left,
 		style.Box("[1] Status", m.statusLines(lw-2), lw, statusH, m.focus == panelStatus),
 		m.filesBox(lw, filesH),
+		m.branchesBox(lw, branchesH),
 		m.logBox(lw, logH),
 	)
 
-	right := m.mainBox(rw, m.mainHeight())
-	if m.conflict != nil {
+	var right string
+	switch {
+	case m.conflict != nil:
 		right = m.conflictBox(rw, m.mainHeight())
+	case m.blame != nil:
+		right = m.blameBox(rw, m.mainHeight())
+	default:
+		right = m.mainBox(rw, m.mainHeight())
 	}
 	if m.showCmdLog {
 		right = lipgloss.JoinVertical(lipgloss.Left, right, m.cmdLogBox(rw, m.cmdLogHeight()))
@@ -742,7 +519,7 @@ func (m *Model) statusLines(w int) []string {
 	if m.info == nil {
 		return []string{style.Dim.Render(" loading…")}
 	}
-	loc := svn.ParseLocation(m.info.RelativeURL)
+	loc := m.location()
 	rev := fmt.Sprintf(" r%d", m.info.Revision)
 	if m.head > m.info.Revision {
 		rev += lipgloss.NewStyle().Foreground(style.Yellow).Render(
@@ -756,82 +533,20 @@ func (m *Model) statusLines(w int) []string {
 	}
 }
 
-func (m *Model) filesBox(w, h int) string {
-	lines := make([]string, len(m.files))
-	for i, f := range m.files {
-		mark := " "
-		if m.selected[f.Path] {
-			mark = lipgloss.NewStyle().Foreground(style.Green).Render("●")
-		}
-		props := " "
-		if f.Props == svn.ItemModified || f.Props == svn.ItemConflicted {
-			props = f.Props.Code()
-		}
-		tree := " "
-		if f.TreeConflict {
-			tree = "C"
-		}
-		code := style.ItemStyle(f).Render(f.Item.Code() + props + tree)
-		line := fmt.Sprintf(" %s %s %s", mark, code, f.Path)
-		if f.Changelist != "" {
-			line += style.Dim.Render(" [" + f.Changelist + "]")
-		}
-		if f.Locked {
-			line += style.Dim.Render(" (locked)")
-		}
-		lines[i] = line
+func (m *Model) statusDetail() string {
+	if m.info == nil {
+		return "Loading…"
 	}
-	if len(lines) == 0 {
-		lines = []string{style.Dim.Render(" clean")}
+	i := m.info
+	head := "unknown (offline?)"
+	if m.head > 0 {
+		head = "r" + strconv.Itoa(m.head)
 	}
-	title := fmt.Sprintf("[2] Files (%d)", len(m.files))
-	if n := len(m.selected); n > 0 {
-		title = fmt.Sprintf("[2] Files (%d, %d selected)", len(m.files), n)
-	}
-	focused := m.focus == panelFiles
-	return style.Box(title, m.fileList.render(lines, w-2, h-2, focused), w, h, focused)
-}
-
-func (m *Model) logBox(w, h int) string {
-	lines := make([]string, len(m.revs))
-	revStyle := lipgloss.NewStyle().Foreground(style.Yellow)
-	authorStyle := lipgloss.NewStyle().Foreground(style.Cyan)
-	for i, r := range m.revs {
-		marker := " "
-		if m.info != nil && r.Number > m.info.Revision {
-			marker = lipgloss.NewStyle().Foreground(style.Yellow).Render("↓")
-		}
-		lines[i] = fmt.Sprintf("%s%s %s %s %s", marker, revStyle.Render(fmt.Sprintf("r%-5d", r.Number)),
-			style.Dim.Render(r.Date.Local().Format("01-02")), authorStyle.Render(truncate(r.Author, 10)), r.Summary())
-	}
-	if m.logLoading {
-		lines = append(lines, style.Dim.Render(" loading…"))
-	}
-	focused := m.focus == panelLog
-	return style.Box("[3] Log", m.logList.render(lines, w-2, h-2, focused), w, h, focused)
-}
-
-func (m *Model) mainBox(w, h int) string {
-	inner := h - 2
-	end := min(len(m.mainLines), m.mainScroll+inner)
-	var lines []string
-	for _, l := range m.mainLines[min(m.mainScroll, end):end] {
-		if m.mainHScroll > 0 {
-			l = ansi.Cut(l, m.mainHScroll, m.mainHScroll+w-2)
-		}
-		lines = append(lines, l)
-	}
-	title := m.mainTitle
-	if title == "" {
-		title = "Main"
-	}
-	if m.ignoreWhitespace && m.lastLeft == panelFiles {
-		title += " (ignoring whitespace)"
-	}
-	if len(m.mainLines) > inner {
-		title += fmt.Sprintf(" %d%%", min(100, (m.mainScroll+inner)*100/len(m.mainLines)))
-	}
-	return style.Box(title, lines, w, h, m.focus == panelMain)
+	return fmt.Sprintf("Working copy: %s\nURL:          %s\nRepository:   %s\nUUID:         %s\n"+
+		"Location:     %s\nBASE:         r%d\nHEAD:         %s\nLast change:  r%d by %s\n\n"+
+		"Press 'u' to update, '?' for all keybindings.",
+		i.WCRoot, i.URL, i.RepoRoot, i.RepoUUID, m.location(),
+		i.Revision, head, i.LastChanged, i.Author)
 }
 
 func (m *Model) cmdLogBox(w, h int) string {
@@ -852,12 +567,22 @@ func (m *Model) bottomBar() string {
 	switch {
 	case m.focus == panelMain && m.conflict != nil:
 		hints = "n/p next/prev conflict · m mine · t theirs · b both · B base · z undo · e edit · esc back"
-	case m.focus == panelFiles:
-		hints = "space select · c commit · a add · d revert · D rm · i ignore · R resolve · u update"
-	case m.focus == panelLog:
-		hints = "enter view · j/k move · u update · U update to rev"
+	case m.focus == panelMain && m.blame != nil:
+		hints = "j/k move · enter show revision · esc back"
+	case m.focus == panelMain && m.mainSearch != "":
+		hints = "n/N next/prev match · / new search · esc clear search"
+	case m.focus == panelMain && m.mainFile != "" && len(m.mainHunks) > 0:
+		hints = "]/[ next/prev hunk · d revert hunk · / search · j/k scroll · esc back"
+	case m.focus == panelMain && len(m.mainSections) > 1:
+		hints = "/ search · z fold file · Z fold all · }/{ next/prev file · j/k scroll · esc back"
 	case m.focus == panelMain:
-		hints = "j/k scroll · ctrl+d/u page · h/l pan · esc back"
+		hints = "/ search · j/k scroll · ctrl+d/u page · h/l pan · esc back"
+	case m.focus == panelFiles:
+		hints = "space select · c commit · a add · d discard · enter fold · ` tree/flat · b blame · l log · L changelist"
+	case m.focus == panelBranches:
+		hints = "space switch · n new branch · t new tag · m merge · e unmerged · enter log · D delete"
+	case m.focus == panelLog:
+		hints = "c cherry-pick · R revert rev · U update to rev · / filter · s stop-on-copy · esc reset"
 	default:
 		hints = "enter details · u update"
 	}

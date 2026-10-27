@@ -78,9 +78,13 @@ func ParseLog(data []byte) ([]Revision, error) {
 // LogOptions controls Log.
 type LogOptions struct {
 	Limit int
-	// From is the revision to start from (descending); 0 means HEAD.
-	From       int
+	// From and To bound the revision range, newest first; From 0 means HEAD
+	// and To 0 means r1.
+	From, To   int
 	StopOnCopy bool
+	// Search keeps revisions whose author, date, message or changed paths
+	// contain this text (svn log --search, case-insensitive).
+	Search string
 }
 
 // Log returns revisions of target (a URL, so revisions newer than the
@@ -90,13 +94,19 @@ func (c *Client) Log(ctx context.Context, target string, opts LogOptions) ([]Rev
 	if opts.Limit > 0 {
 		args = append(args, "-l", strconv.Itoa(opts.Limit))
 	}
-	from := "HEAD"
+	from, to := "HEAD", "1"
 	if opts.From > 0 {
 		from = strconv.Itoa(opts.From)
 	}
-	args = append(args, "-r", from+":1")
+	if opts.To > 0 {
+		to = strconv.Itoa(opts.To)
+	}
+	args = append(args, "-r", from+":"+to)
 	if opts.StopOnCopy {
 		args = append(args, "--stop-on-copy")
+	}
+	if opts.Search != "" {
+		args = append(args, "--search", opts.Search)
 	}
 	args = append(args, target)
 	out, err := c.Run(ctx, args...)
@@ -104,4 +114,16 @@ func (c *Client) Log(ctx context.Context, target string, opts LogOptions) ([]Rev
 		return nil, err
 	}
 	return ParseLog(out)
+}
+
+// RevisionInfo returns the log entry of a single revision of target.
+func (c *Client) RevisionInfo(ctx context.Context, target string, rev int) (*Revision, error) {
+	revs, err := c.Log(ctx, target, LogOptions{Limit: 1, From: rev, To: rev})
+	if err != nil {
+		return nil, err
+	}
+	if len(revs) == 0 {
+		return nil, fmt.Errorf("r%d does not touch %s", rev, target)
+	}
+	return &revs[0], nil
 }

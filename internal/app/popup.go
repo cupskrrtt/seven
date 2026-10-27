@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -141,6 +142,7 @@ func newInputPopup(heading string, labels []string, masked []bool, onSubmit func
 	for i := range labels {
 		ti := textinput.New()
 		ti.Prompt = ""
+		ti.Cursor.SetMode(cursor.CursorStatic) // no blink timer while a popup is open
 		if i < len(masked) && masked[i] {
 			ti.EchoMode = textinput.EchoPassword
 		}
@@ -207,6 +209,7 @@ func newCommitPopup(heading string, onSubmit func(string) tea.Cmd) *commitPopup 
 	ta.CharLimit = 0
 	// enter commits; alt+enter or ctrl+j inserts a newline.
 	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "ctrl+j"))
+	ta.Cursor.SetMode(cursor.CursorStatic)
 	ta.Focus()
 	return &commitPopup{heading: heading, ta: ta, onSubmit: onSubmit}
 }

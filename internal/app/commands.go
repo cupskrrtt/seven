@@ -24,13 +24,28 @@ type infoMsg struct {
 type statusMsg struct{ files []svn.FileStatus }
 
 type logMsg struct {
+	gen    int // matches Model.logGen when the request was made
 	revs   []svn.Revision
 	append bool
 }
 
+type branchesMsg struct {
+	branches []svn.Branch
+	err      error
+}
+
+type blameMsg struct {
+	path  string
+	lines []svn.BlameLine
+}
+
+// revisionMsg delivers a single log entry fetched on demand (e.g. from blame).
+type revisionMsg struct{ rev svn.Revision }
+
 type diffMsg struct {
 	key  string // path or "r<rev>"; stale results are dropped
 	text string
+	file string // set for a working-copy file diff, enabling hunk revert
 }
 
 // opDoneMsg reports the result of a mutating operation; a refresh follows.
@@ -83,14 +98,59 @@ func (m *Model) loadStatus() tea.Cmd {
 	})
 }
 
-// loadLog fetches a page of history; from=0 starts at HEAD.
-func (m *Model) loadLog(url string, from int) tea.Cmd {
+// loadLog fetches a page of history for the log panel's current target
+// and filters; from=0 starts at the top of the range.
+func (m *Model) loadLog(from int) tea.Cmd {
+	target, gen := m.logURL(), m.logGen
+	opts := m.logOpts
+	opts.Limit = logPageSize
+	if from > 0 {
+		opts.From = from
+	}
 	return m.svnCmd(func(ctx context.Context) tea.Msg {
-		revs, err := m.client.Log(ctx, url, svn.LogOptions{Limit: logPageSize, From: from})
+		revs, err := m.client.Log(ctx, target, opts)
 		if err != nil {
 			return errMsg{err}
 		}
-		return logMsg{revs: revs, append: from > 0}
+		return logMsg{gen: gen, revs: revs, append: from > 0}
+	})
+}
+
+func (m *Model) loadBranches(loc svn.Location) tea.Cmd {
+	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		bs, err := m.client.Branches(ctx, loc)
+		return branchesMsg{branches: bs, err: err}
+	})
+}
+
+func (m *Model) loadBlame(path string) tea.Cmd {
+	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		lines, err := m.client.Blame(ctx, path)
+		if err != nil {
+			return errMsg{err}
+		}
+		return blameMsg{path: path, lines: lines}
+	})
+}
+
+func (m *Model) loadRevision(target string, rev int) tea.Cmd {
+	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		r, err := m.client.RevisionInfo(ctx, target, rev)
+		if err != nil {
+			return errMsg{err}
+		}
+		return revisionMsg{*r}
+	})
+}
+
+// loadText runs fn and shows its output in the main view under key.
+func (m *Model) loadText(key string, fn func(ctx context.Context) (string, error)) tea.Cmd {
+	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		text, err := fn(ctx)
+		if err != nil {
+			return errMsg{err}
+		}
+		return diffMsg{key: key, text: text}
 	})
 }
 
@@ -107,32 +167,72 @@ func (m *Model) loadFileDiff(f svn.FileStatus) tea.Cmd {
 		if strings.TrimSpace(text) == "" {
 			text = fmt.Sprintf("No textual changes (%s).", f.Item)
 		}
-		return diffMsg{key: f.Path, text: text}
+		return diffMsg{key: f.Path, text: text, file: f.Path}
+	})
+}
+
+// revisionText formats a revision header and changed paths.
+func revisionText(rev svn.Revision) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Revision: r%d\nAuthor:   %s\nDate:     %s\n\n", rev.Number, rev.Author,
+		rev.Date.Local().Format("2006-01-02 15:04:05"))
+	for _, l := range strings.Split(strings.TrimSpace(rev.Message), "\n") {
+		b.WriteString("    " + l + "\n")
+	}
+	b.WriteString("\nChanged paths:\n")
+	for _, p := range rev.Paths {
+		fmt.Fprintf(&b, "   %s %s", p.Action, p.Path)
+		if p.CopyFrom != "" {
+			fmt.Fprintf(&b, " (from %s:%d)", p.CopyFrom, p.CopyRev)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// loadDirDiff shows the combined diff of a folder's versioned changes and
+// lists its unversioned items.
+func (m *Model) loadDirDiff(key string, files []svn.FileStatus) tea.Cmd {
+	ignoreWS := m.ignoreWhitespace
+	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		var versioned, unversioned []string
+		for _, f := range files {
+			if f.Versioned() {
+				versioned = append(versioned, f.Path)
+			} else {
+				unversioned = append(unversioned, f.Path)
+			}
+		}
+		versioned = topLevel(versioned)
+		var b strings.Builder
+		if len(versioned) > 0 {
+			diff, err := m.client.Diff(ctx, versioned[0], ignoreWS, versioned[1:]...)
+			if err != nil {
+				return errMsg{err}
+			}
+			b.WriteString(diff)
+		}
+		if len(unversioned) > 0 {
+			b.WriteString("\nUnversioned:\n")
+			for _, p := range unversioned {
+				b.WriteString("   ? " + p + "\n")
+			}
+		}
+		if b.Len() == 0 {
+			b.WriteString("No changes.")
+		}
+		return diffMsg{key: key, text: b.String()}
 	})
 }
 
 func (m *Model) loadRevisionDiff(rev svn.Revision, repoRoot string) tea.Cmd {
 	return m.svnCmd(func(ctx context.Context) tea.Msg {
-		var b strings.Builder
-		fmt.Fprintf(&b, "Revision: r%d\nAuthor:   %s\nDate:     %s\n\n", rev.Number, rev.Author,
-			rev.Date.Local().Format("2006-01-02 15:04:05"))
-		for _, l := range strings.Split(strings.TrimSpace(rev.Message), "\n") {
-			b.WriteString("    " + l + "\n")
-		}
-		b.WriteString("\nChanged paths:\n")
-		for _, p := range rev.Paths {
-			fmt.Fprintf(&b, "   %s %s", p.Action, p.Path)
-			if p.CopyFrom != "" {
-				fmt.Fprintf(&b, " (from %s:%d)", p.CopyFrom, p.CopyRev)
-			}
-			b.WriteString("\n")
-		}
+		text := revisionText(rev)
 		diff, err := m.client.RevisionDiff(ctx, repoRoot, rev.Number)
 		if err != nil {
 			return errMsg{err}
 		}
-		b.WriteString("\n" + diff)
-		return diffMsg{key: fmt.Sprintf("r%d", rev.Number), text: b.String()}
+		return diffMsg{key: fmt.Sprintf("r%d", rev.Number), text: text + "\n" + diff}
 	})
 }
 

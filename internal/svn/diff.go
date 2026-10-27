@@ -2,6 +2,7 @@ package svn
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 )
@@ -49,6 +50,55 @@ func ParseDiff(text string) []DiffLine {
 	return lines
 }
 
+// DiffHunk is a text hunk of a diff: the "@@" line through the line
+// before the next hunk or file header. Property hunks ("##") are excluded.
+type DiffHunk struct {
+	Start, End int // inclusive indices into the []DiffLine
+}
+
+// DiffHunks finds the text hunks in lines.
+func DiffHunks(lines []DiffLine) []DiffHunk {
+	var hunks []DiffHunk
+	for i := 0; i < len(lines); i++ {
+		if lines[i].Kind != LineHunk || !strings.HasPrefix(lines[i].Text, "@@") {
+			continue
+		}
+		end := i
+		for end+1 < len(lines) && lines[end+1].Kind != LineHunk && lines[end+1].Kind != LineHeader {
+			end++
+		}
+		hunks = append(hunks, DiffHunk{Start: i, End: end})
+		i = end
+	}
+	return hunks
+}
+
+// HunkPatch builds a standalone patch containing only hunk h together with
+// the file header ("Index:" through "+++") it belongs to.
+func HunkPatch(lines []DiffLine, h DiffHunk) (string, error) {
+	start := -1
+	for i := h.Start - 1; i >= 0; i-- {
+		if strings.HasPrefix(lines[i].Text, "Index: ") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return "", errors.New("hunk has no file header")
+	}
+	var b strings.Builder
+	for i := start; i < h.Start; i++ {
+		if lines[i].Kind != LineHeader {
+			break
+		}
+		b.WriteString(lines[i].Text + "\n")
+	}
+	for i := h.Start; i <= h.End; i++ {
+		b.WriteString(lines[i].Text + "\n")
+	}
+	return b.String(), nil
+}
+
 // pathArg escapes a working copy path so svn does not treat a trailing
 // "@..." as a peg revision.
 func pathArg(p string) string {
@@ -66,13 +116,13 @@ func pathArgs(paths []string) []string {
 	return out
 }
 
-// Diff returns the local diff of path against BASE.
-func (c *Client) Diff(ctx context.Context, path string, ignoreWhitespace bool) (string, error) {
+// Diff returns the local diff of path (and any more paths) against BASE.
+func (c *Client) Diff(ctx context.Context, path string, ignoreWhitespace bool, more ...string) (string, error) {
 	args := []string{"diff"}
 	if ignoreWhitespace {
 		args = append(args, "-x", "-w")
 	}
-	args = append(args, "--", pathArg(path))
+	args = append(append(args, "--", pathArg(path)), pathArgs(more)...)
 	out, err := c.Run(ctx, args...)
 	return string(out), err
 }

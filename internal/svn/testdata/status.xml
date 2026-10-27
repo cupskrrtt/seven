@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="b.txt">
+<wc-status
+   props="none"
+   item="unversioned">
+</wc-status>
+</entry>
+<entry
+   path="a.txt">
+<wc-status
+   item="modified"
+   revision="7"
+   props="none">
+<commit
+   revision="6">
+<author>alice</author>
+<date>2026-10-20T10:00:00.000000Z</date>
+</commit>
+</wc-status>
+</entry>
+<entry
+   path="c.txt">
+<wc-status
+   item="conflicted"
+   revision="7"
+   props="none">
+</wc-status>
+</entry>
+<entry
+   path="dir">
+<wc-status
+   item="normal"
+   revision="7"
+   props="normal">
+</wc-status>
+</entry>
+</target>
+<changelist
+   name="wip">
+<entry
+   path="d.txt">
+<wc-status
+   item="added"
+   revision="-1"
+   props="none">
+</wc-status>
+</entry>
+</changelist>
+</status>

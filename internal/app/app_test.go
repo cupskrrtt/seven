@@ -1,0 +1,192 @@
+package app
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/cupskrrtt/seven/internal/svn"
+)
+
+func sh(t *testing.T, dir string, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
+// setup returns a model for a trunk checkout containing a committed,
+// locally modified a.txt and an unversioned b.txt, plus the trunk URL.
+func setup(t *testing.T) (*Model, string) {
+	t.Helper()
+	if _, err := exec.LookPath("svnadmin"); err != nil {
+		t.Skip("svn not installed")
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	sh(t, root, "svnadmin", "create", repo)
+	url := "file://" + filepath.ToSlash(repo)
+	if !strings.HasPrefix(url, "file:///") {
+		url = "file:///" + filepath.ToSlash(repo)
+	}
+	sh(t, root, "svn", "mkdir", "-q", "-m", "layout", url+"/trunk")
+	wc := filepath.Join(root, "wc")
+	sh(t, root, "svn", "checkout", "-q", url+"/trunk", wc)
+	os.WriteFile(filepath.Join(wc, "a.txt"), []byte("one\n"), 0o644)
+	sh(t, wc, "svn", "add", "-q", "a.txt")
+	sh(t, wc, "svn", "commit", "-q", "-m", "Add files")
+	os.WriteFile(filepath.Join(wc, "a.txt"), []byte("one\nLOCAL\n"), 0o644)
+	os.WriteFile(filepath.Join(wc, "b.txt"), []byte("new\n"), 0o644)
+
+	client, err := svn.NewClient(wc)
+	if err != nil {
+		t.Skip(err)
+	}
+	m := New(client)
+	m.refreshEvery = 0
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	drain(t, m, m.Init())
+	return m, url + "/trunk"
+}
+
+// drain runs cmd and every command produced in response, synchronously.
+// Cursor-blink ticks from text inputs are dropped so this terminates.
+func drain(t *testing.T, m *Model, cmd tea.Cmd) {
+	t.Helper()
+	queue := []tea.Cmd{cmd}
+	for steps := 0; len(queue) > 0; steps++ {
+		if steps > 200 {
+			t.Fatal("drain: too many steps")
+		}
+		c := queue[0]
+		queue = queue[1:]
+		if c == nil {
+			continue
+		}
+		done := make(chan tea.Msg, 1)
+		go func() { done <- c() }()
+		var msg tea.Msg
+		select {
+		case msg = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("drain: command timed out")
+		}
+		switch msg := msg.(type) {
+		case nil:
+		case tea.BatchMsg:
+			queue = append(queue, msg...)
+		default:
+			if strings.Contains(fmt.Sprintf("%T", msg), "cursor.") {
+				continue
+			}
+			_, next := m.Update(msg)
+			queue = append(queue, next)
+		}
+	}
+}
+
+func press(t *testing.T, m *Model, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		var msg tea.KeyMsg
+		switch k {
+		case "enter":
+			msg = tea.KeyMsg{Type: tea.KeyEnter}
+		case "esc":
+			msg = tea.KeyMsg{Type: tea.KeyEsc}
+		case "tab":
+			msg = tea.KeyMsg{Type: tea.KeyTab}
+		default:
+			msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+		}
+		_, cmd := m.Update(msg)
+		drain(t, m, cmd)
+	}
+}
+
+func screen(m *Model) string { return ansi.Strip(m.View()) }
+
+func assertScreen(t *testing.T, m *Model, want ...string) {
+	t.Helper()
+	s := screen(m)
+	for _, w := range want {
+		if !strings.Contains(s, w) {
+			t.Fatalf("screen missing %q:\n%s", w, s)
+		}
+	}
+}
+
+func TestInitialRender(t *testing.T) {
+	m, _ := setup(t)
+	assertScreen(t, m, "trunk", "r2", "M   a.txt", "?   b.txt", "Add files", "+LOCAL", "Diff · a.txt")
+}
+
+func TestAddAndCommit(t *testing.T) {
+	m, _ := setup(t)
+
+	press(t, m, "j") // b.txt
+	assertScreen(t, m, "Diff · b.txt", "+new")
+	press(t, m, "a")
+	assertScreen(t, m, "Added b.txt", "A   b.txt")
+
+	// Select only b.txt and commit it.
+	press(t, m, " ")
+	if !m.selected["b.txt"] || len(m.selected) != 1 {
+		t.Fatalf("selected = %v", m.selected)
+	}
+	press(t, m, "c")
+	assertScreen(t, m, "Commit 1 file(s)")
+	press(t, m, "m", "y", " ", "c", "o", "m", "m", "i", "t", "enter")
+
+	assertScreen(t, m, "Committed r3", "my commit")
+	if len(m.files) != 1 || m.files[0].Path != "a.txt" || len(m.selected) != 0 {
+		t.Fatalf("after commit files = %+v selected = %v", m.files, m.selected)
+	}
+}
+
+func TestRevertNeedsConfirm(t *testing.T) {
+	m, _ := setup(t)
+	press(t, m, "d")
+	assertScreen(t, m, "Discard all local changes to a.txt?")
+	press(t, m, "esc")
+	if len(m.files) != 2 {
+		t.Fatalf("esc should not revert, files = %+v", m.files)
+	}
+	press(t, m, "d", "y")
+	assertScreen(t, m, "Reverted a.txt")
+	if len(m.files) != 1 || m.files[0].Path != "b.txt" {
+		t.Fatalf("files = %+v", m.files)
+	}
+}
+
+func TestUpdateBehindHead(t *testing.T) {
+	m, trunk := setup(t)
+	other := filepath.Join(t.TempDir(), "other")
+	sh(t, ".", "svn", "checkout", "-q", trunk, other)
+	os.WriteFile(filepath.Join(other, "c.txt"), []byte("remote\n"), 0o644)
+	sh(t, other, "svn", "add", "-q", "c.txt")
+	sh(t, other, "svn", "commit", "-q", "-m", "Remote change")
+
+	press(t, m, "r")
+	assertScreen(t, m, "behind HEAD r3", "Remote change")
+	press(t, m, "u")
+	assertScreen(t, m, "Updated to r3", "(up to date)")
+}
+
+func TestLogPanelShowsRevision(t *testing.T) {
+	m, _ := setup(t)
+	press(t, m, "3")
+	assertScreen(t, m, "Revision r2", "Author:", "A /trunk/a.txt", "+one")
+	press(t, m, "?")
+	assertScreen(t, m, "Keybindings")
+	press(t, m, "esc", "q")
+}

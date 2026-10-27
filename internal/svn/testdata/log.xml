@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<log>
+<logentry
+   revision="6">
+<author>alice</author>
+<date>2026-10-20T10:00:00.123456Z</date>
+<paths>
+<path
+   text-mods="true"
+   kind="file"
+   action="M"
+   prop-mods="false">/proj/branches/feature-x/a.txt</path>
+</paths>
+<msg>Fix the thing
+
+Longer description.</msg>
+</logentry>
+<logentry
+   revision="5">
+<author>bob</author>
+<date>2026-10-19T09:00:00.000000Z</date>
+<paths>
+<path
+   kind="dir"
+   action="A"
+   copyfrom-path="/proj/trunk"
+   copyfrom-rev="4">/proj/branches/feature-x</path>
+</paths>
+<msg>Create branch</msg>
+</logentry>
+</log>

@@ -26,11 +26,15 @@ Linux, macOS and Windows.
 
 ## Features
 
-- **Files**: a collapsible tree (or flat list) of changes. Select files or whole folders for commit,
-  add, revert, delete, ignore, blame, view a file's log, changelists. Discarding always saves a
-  **backup** first.
-- **Diffs**: colourised, with **search** (`/`, `n`/`N`), per-file **folding** (`z`, `Z`, `}`/`{`; diffs
-  with more than 10 files open folded) and **hunk-level revert** (`]`/`[` then `d`).
+- **Files**: a collapsible tree (or flat list) of changes, grouped by **changelist** when you use
+  them. Select files, folders or whole changelists for commit; add, revert, delete, ignore, blame,
+  view a file's log. Discarding always saves a **backup** first. Refreshes by itself, and as soon
+  as you switch back to the terminal.
+- **Diffs**: unified or **side by side** (`v`), colourised, with **search** (`/`, `n`/`N`), per-file
+  **folding** (`z`, `Z`, `}`/`{`; diffs with more than 10 files open folded) and **hunk-level
+  revert** (`]`/`[` then `d`).
+- **Any svn command** from inside seven with `:` — the output is shown in the main view and can be
+  searched.
 - **Commit** from a message box or your `$EDITOR`.
 - **Conflicts**: resolve with mine / theirs / base (full or only conflicting parts), or pick
   **hunk by hunk** in a lazygit-style picker with undo.
@@ -47,7 +51,7 @@ Linux, macOS and Windows.
 - **Incoming changes** (`*`): what changed on the server since your last update.
 - **Repository browser**: browse any path at any revision, view files, export, check out.
 - **Maintenance**: cleanup (optionally removing unversioned / ignored files), relocate.
-- **Config file** with custom commands, themes, key remapping; mouse support; credentials prompt;
+- **Config file** with custom commands, themes, rebindable keys; mouse support; credentials prompt;
   a command log (`@`) showing every svn command seven runs.
 
 ## Requirements
@@ -113,6 +117,7 @@ the focused panel.
 | `u` / `U` | update to HEAD / to a revision |
 | `*` | toggle incoming changes (`svn status -u`) |
 | `B` | repository browser |
+| `:` | run an svn command (e.g. `: info`, `: log -l 5 -v`) |
 | `x` | actions: cleanup, relocate, shelves, … |
 | `@` | command log |
 | `?` / `q` | help / quit |
@@ -121,7 +126,7 @@ the focused panel.
 
 | Key | Action |
 |---|---|
-| `space` | select for commit (on a folder: everything inside) |
+| `space` | select for commit (on a folder or changelist header: everything inside) |
 | `A` | select all / clear |
 | `c` / `C` | commit (selected, or all changes) / commit with `$EDITOR` |
 | `a` | add unversioned file or folder contents |
@@ -144,11 +149,20 @@ the focused panel.
 **Log**: `c` cherry-pick (from another branch's log) · `R` revert revision · `U` update to
 revision · `/` filter · `s` stop-on-copy · `esc` reset
 
-**Diff / main view**: `/` search · `n`/`N` next/previous match · `z`/`Z` fold file/all ·
-`}`/`{` next/previous file · `]`/`[` select hunk · `d` revert hunk · `h`/`l` pan · `ctrl+d`/`ctrl+u` page
+**Diff / main view**: `v` side by side ↔ unified · `/` search · `n`/`N` next/previous match ·
+`z`/`Z` fold file/all · `}`/`{` next/previous file · `]`/`[` select hunk · `d` revert hunk ·
+`h`/`l` pan · `ctrl+d`/`ctrl+u` page. Side by side needs a terminal at least 100 columns wide and
+shows line numbers for both versions.
 
 **Conflict picker**: `n`/`p` next/previous conflict · `m` mine · `t` theirs · `b` both ·
 `B` base · `z` undo · `e` edit
+
+## Changelists
+
+`L` on a file moves it into a changelist (new or existing) or out of one. As soon as any changelist
+exists, the Files panel is split into one section per changelist plus **Changes** for everything
+else. On a section header, `space` selects the whole changelist for commit, `enter` folds it, `d`
+discards it (with a backup) and the main view shows its combined diff.
 
 ## Safety
 
@@ -189,8 +203,16 @@ theme:                    # "#rrggbb" or ANSI colour numbers; empty = default
   accent: "#ff79c6"
   selectedBg: "#44475a"
 
-remap:                    # "your key": "seven key"
-  "ctrl+s": "c"
+sideBySide: false         # start diffs in two columns (toggle with v)
+
+keybindings:              # rebind actions by name: context → action → key
+  files:
+    commit: "ctrl+s"      # c no longer commits; ctrl+s does
+  global:
+    quit: "Q"
+
+remap:                    # low-level: "your key": "seven key" (the old key keeps working)
+  "ctrl+p": "?"
 
 customCommands:
   - key: "X"
@@ -207,6 +229,17 @@ customCommands:
     subprocess: true      # hand it the terminal
     confirm: false        # ask before running
 ```
+
+### Key bindings
+
+Every rebindable action has a name: the help screen (`?`) shows it next to each key, e.g.
+`files.commit` or `diff.side-by-side`. Contexts are `global`, `status`, `files`, `branches`,
+`log`, `diff`, `props`, `browser`, `blame` and `conflict`. A rebound action's old key stops
+working in that context, and the help screen shows the new key. Unknown contexts or actions and
+keys bound twice are reported when seven starts. Keys use Bubble Tea names: `a`, `A`, `ctrl+s`,
+`alt+x`, `enter`, `space`, `tab`, `f2`, …
+
+### Custom commands
 
 Custom commands run in the working-copy root through `sh -c` (`cmd /C` on Windows). The command
 is a Go template with these fields:

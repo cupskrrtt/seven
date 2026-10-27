@@ -6,6 +6,8 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/cupskrrtt/seven/internal/svn"
 	"github.com/cupskrrtt/seven/internal/ui/style"
 )
@@ -83,27 +85,168 @@ func (m *Model) rebuildVisible() {
 			i = m.mainSections[s].end // a folded file shows only its header row
 		}
 	}
+	m.buildRows()
 	m.clampMainScroll()
+}
+
+// diffRow is one screen row of the main view. A full row shows raw line
+// raw across the whole width; a side-by-side row pairs an old line (left)
+// with a new line (right), either of which may be -1.
+type diffRow struct {
+	raw          int // first raw line in the row; rows are ordered by it
+	full         bool
+	left, right  int
+	oldNo, newNo int // line numbers in the old and new file (0 = none)
+}
+
+func (r diffRow) has(i int) bool { return r.raw == i || r.left == i || r.right == i }
+
+// sideBySideMinWidth is the narrowest terminal that gets two columns.
+const sideBySideMinWidth = 100
+
+func (m *Model) sideBySideActive() bool { return m.sideBySide && m.width >= sideBySideMinWidth }
+
+var hunkHeaderRe = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+
+// buildRows lays the visible lines out as screen rows: one per line in
+// unified mode; in side-by-side mode, runs of removed and added lines
+// inside a hunk are paired up and context appears on both sides.
+func (m *Model) buildRows() {
+	m.mainRows = m.mainRows[:0]
+	if !m.sideBySideActive() {
+		for _, i := range m.mainVisible {
+			m.mainRows = append(m.mainRows, diffRow{raw: i, full: true, left: -1, right: -1})
+		}
+		return
+	}
+	inHunk := false
+	oldNo, newNo := 0, 0
+	vis := m.mainVisible
+	for k := 0; k < len(vis); k++ {
+		i := vis[k]
+		l := m.mainRaw[i]
+		switch {
+		case l.Kind == svn.LineHunk:
+			if g := hunkHeaderRe.FindStringSubmatch(l.Text); g != nil {
+				inHunk = true
+				fmt.Sscan(g[1], &oldNo)
+				fmt.Sscan(g[2], &newNo)
+			} else {
+				inHunk = false // a property hunk ("## ... ##")
+			}
+			m.mainRows = append(m.mainRows, diffRow{raw: i, full: true, left: -1, right: -1})
+		case !inHunk || l.Kind == svn.LineHeader || strings.HasPrefix(l.Text, `\`):
+			if l.Kind == svn.LineHeader {
+				inHunk = false
+			}
+			m.mainRows = append(m.mainRows, diffRow{raw: i, full: true, left: -1, right: -1})
+		case l.Kind == svn.LineContext:
+			m.mainRows = append(m.mainRows, diffRow{raw: i, left: i, right: i, oldNo: oldNo, newNo: newNo})
+			oldNo++
+			newNo++
+		default:
+			// A run of removed lines followed by added lines.
+			var removed, added []int
+			for ; k < len(vis) && m.mainRaw[vis[k]].Kind == svn.LineRemoved; k++ {
+				removed = append(removed, vis[k])
+			}
+			for ; k < len(vis) && m.mainRaw[vis[k]].Kind == svn.LineAdded; k++ {
+				added = append(added, vis[k])
+			}
+			k--
+			for j := 0; j < max(len(removed), len(added)); j++ {
+				row := diffRow{left: -1, right: -1}
+				if j < len(removed) {
+					row.left, row.oldNo = removed[j], oldNo
+					oldNo++
+				}
+				if j < len(added) {
+					row.right, row.newNo = added[j], newNo
+					newNo++
+				}
+				row.raw = row.left
+				if row.raw < 0 || (row.right >= 0 && row.right < row.raw) {
+					row.raw = row.right
+				}
+				m.mainRows = append(m.mainRows, row)
+			}
+		}
+	}
 }
 
 func (m *Model) clampMainScroll() {
 	page := max(1, m.mainHeight()-2)
-	m.mainScroll = max(0, min(m.mainScroll, len(m.mainVisible)-page))
+	m.mainScroll = max(0, min(m.mainScroll, len(m.mainRows)-page))
 }
 
-// visibleIndex returns the visible row showing raw line i, unfolding its
+// visibleIndex returns the screen row showing raw line i, unfolding its
 // file if needed.
 func (m *Model) visibleIndex(i int) int {
 	if s := m.mainSectionOf[i]; s >= 0 && m.mainFolded[s] && i != m.mainSections[s].start {
 		delete(m.mainFolded, s)
 		m.rebuildVisible()
 	}
-	for v, r := range m.mainVisible {
-		if r >= i {
+	for v, r := range m.mainRows {
+		if r.has(i) {
 			return v
 		}
 	}
-	return len(m.mainVisible) - 1
+	for v, r := range m.mainRows {
+		if r.raw >= i {
+			return v
+		}
+	}
+	return len(m.mainRows) - 1
+}
+
+// toggleSideBySide switches layouts, keeping the top line in place.
+func (m *Model) toggleSideBySide() {
+	m.sideBySide = !m.sideBySide
+	top := -1
+	if m.mainScroll < len(m.mainRows) {
+		top = m.mainRows[m.mainScroll].raw
+	}
+	m.buildRows()
+	if top >= 0 {
+		m.mainScroll = m.visibleIndex(top)
+	}
+	m.clampMainScroll()
+	switch {
+	case m.sideBySide && !m.sideBySideActive():
+		m.status = fmt.Sprintf("Side-by-side needs a terminal at least %d columns wide", sideBySideMinWidth)
+	case m.sideBySide:
+		m.status = "Side-by-side diff"
+	default:
+		m.status = "Unified diff"
+	}
+}
+
+// renderSideBySide draws a paired row in two columns of width half each.
+func (m *Model) renderSideBySide(r diffRow, half int) string {
+	side := func(i, no int) string {
+		if i < 0 {
+			return strings.Repeat(" ", half) // nothing on this side
+		}
+		l := m.mainRaw[i]
+		text := l.Text
+		if text != "" {
+			text = text[1:] // drop the +/-/space marker
+		}
+		body := svn.DiffLine{Kind: l.Kind, Text: text}
+		var rendered string
+		if m.mainSearchRe != nil && m.mainSearchRe.MatchString(style.ExpandTabs(text)) {
+			current := m.mainMatch >= 0 && m.mainMatches[m.mainMatch] == i
+			rendered = style.DiffLineHighlight(body, m.mainSearchRe, current)
+		} else {
+			rendered = style.DiffLine(body)
+		}
+		if m.mainHScroll > 0 {
+			rendered = ansi.Cut(rendered, m.mainHScroll, m.mainHScroll+half)
+		}
+		num := style.Dim.Render(fmt.Sprintf("%4d ", no))
+		return style.Pad(num+rendered, half)
+	}
+	return side(r.left, r.oldNo) + style.Dim.Render("│") + side(r.right, r.newNo)
 }
 
 // scrollToRaw makes raw lines from..to visible, scrolling only if needed,

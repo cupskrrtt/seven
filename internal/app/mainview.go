@@ -30,6 +30,9 @@ func (m *Model) syncMain() tea.Cmd {
 				return nil
 			}
 			m.mainKey, m.mainTitle = key, "Diff · "+dir.key+"/"
+			if dir.group {
+				m.mainTitle = "Diff · " + groupLabel(dir)
+			}
 			m.setMainText("Loading…")
 			return m.loadDirDiff(key, filesUnder(dir))
 		}
@@ -135,11 +138,14 @@ func (m *Model) handleMainKey(key string) tea.Cmd {
 	case "g", "home":
 		m.mainScroll = 0
 	case "G", "end":
-		m.mainScroll = len(m.mainVisible)
+		m.mainScroll = len(m.mainRows)
 	case "h", "left":
 		m.mainHScroll = max(0, m.mainHScroll-8)
 	case "l", "right":
 		m.mainHScroll += 8
+	case "v":
+		m.toggleSideBySide()
+		return nil
 	case "/":
 		p := newInputPopup("Search diff", []string{"Find"}, nil, func(v []string) tea.Cmd {
 			m.setSearch(v[0])
@@ -235,7 +241,7 @@ func (m *Model) confirmRevertHunk() tea.Cmd {
 
 func (m *Model) mainBox(w, h int) string {
 	inner := h - 2
-	end := min(len(m.mainVisible), m.mainScroll+inner)
+	end := min(len(m.mainRows), m.mainScroll+inner)
 	gutter := m.mainFile != "" && len(m.mainHunks) > 0
 	var sel svn.DiffHunk
 	if m.mainHunk >= 0 && m.mainHunk < len(m.mainHunks) {
@@ -244,12 +250,22 @@ func (m *Model) mainBox(w, h int) string {
 		sel = svn.DiffHunk{Start: -1, End: -2}
 	}
 	marker := lipgloss.NewStyle().Foreground(style.Yellow).Bold(true).Render("▌")
+	width := w - 2
+	if gutter {
+		width--
+	}
 	var lines []string
 	for v := min(m.mainScroll, end); v < end; v++ {
-		i := m.mainVisible[v]
-		l := m.renderMainLine(i)
-		if m.mainHScroll > 0 {
-			l = ansi.Cut(l, m.mainHScroll, m.mainHScroll+w-2)
+		r := m.mainRows[v]
+		i := r.raw
+		var l string
+		if r.full {
+			l = m.renderMainLine(i)
+			if m.mainHScroll > 0 {
+				l = ansi.Cut(l, m.mainHScroll, m.mainHScroll+width)
+			}
+		} else {
+			l = m.renderSideBySide(r, (width-1)/2)
 		}
 		if gutter {
 			if i >= sel.Start && i <= sel.End {
@@ -289,8 +305,8 @@ func (m *Model) mainBox(w, h int) string {
 		}
 		title += fmt.Sprintf(" · /%s %d/%d", m.mainSearch, cur, len(m.mainMatches))
 	}
-	if len(m.mainVisible) > inner {
-		title += fmt.Sprintf(" %d%%", min(100, (m.mainScroll+inner)*100/len(m.mainVisible)))
+	if len(m.mainRows) > inner {
+		title += fmt.Sprintf(" %d%%", min(100, (m.mainScroll+inner)*100/len(m.mainRows)))
 	}
 	return style.Box(title, lines, w, h, m.focus == panelMain)
 }

@@ -13,6 +13,7 @@ type treeNode struct {
 	key      string // slash-separated path, stable across refreshes
 	name     string // display name; compressed chains read "a/b/c"
 	dir      bool
+	group    bool            // a changelist section header (name is the changelist)
 	file     *svn.FileStatus // status entry for this path, nil for plain folders
 	children []*treeNode
 }
@@ -97,6 +98,52 @@ func filesUnder(n *treeNode) []svn.FileStatus {
 	return out
 }
 
+// fileGroup is the files of one changelist (or of none) and, when the
+// working copy uses changelists, the header row shown above them.
+type fileGroup struct {
+	header *treeNode // nil when there are no changelists
+	files  []svn.FileStatus
+}
+
+// changelistGroups splits files by changelist: one group per changelist,
+// sorted, then "Changes" for files in none. Without changelists there is a
+// single headerless group.
+func changelistGroups(files []svn.FileStatus) []fileGroup {
+	byName := map[string][]svn.FileStatus{}
+	var names []string
+	for _, f := range files {
+		if _, ok := byName[f.Changelist]; !ok && f.Changelist != "" {
+			names = append(names, f.Changelist)
+		}
+		byName[f.Changelist] = append(byName[f.Changelist], f)
+	}
+	if len(names) == 0 {
+		return []fileGroup{{files: files}}
+	}
+	sort.Strings(names)
+	var groups []fileGroup
+	for _, n := range names {
+		groups = append(groups, fileGroup{header: &treeNode{key: "cl:" + n, name: n, dir: true, group: true}, files: byName[n]})
+	}
+	if rest := byName[""]; len(rest) > 0 {
+		groups = append(groups, fileGroup{header: &treeNode{key: "cl:", name: "Changes", dir: true, group: true}, files: rest})
+	}
+	return groups
+}
+
+// groupTree is the tree (or, in flat mode, the list) of one group's files.
+func (m *Model) groupTree(files []svn.FileStatus) *treeNode {
+	if !m.flatFiles {
+		return buildTree(files)
+	}
+	root := &treeNode{dir: true}
+	for i := range files {
+		f := &files[i]
+		root.children = append(root.children, &treeNode{key: filepath.ToSlash(f.Path), name: f.Path, file: f})
+	}
+	return root
+}
+
 // rebuildRows recomputes the visible rows from m.files, keeping the cursor
 // on the same path when it is still visible.
 func (m *Model) rebuildRows() {
@@ -104,14 +151,18 @@ func (m *Model) rebuildRows() {
 	if r, ok := m.currentRow(); ok {
 		current = r.node.key
 	}
-	if m.flatFiles {
-		m.fileRows = m.fileRows[:0]
-		for i := range m.files {
-			f := &m.files[i]
-			m.fileRows = append(m.fileRows, fileRow{node: &treeNode{key: filepath.ToSlash(f.Path), name: f.Path, file: f}})
+	m.fileRows = nil
+	for _, g := range changelistGroups(m.files) {
+		root := m.groupTree(g.files)
+		if g.header == nil {
+			m.fileRows = flatten(root, 0, m.collapsed, m.fileRows)
+			continue
 		}
-	} else {
-		m.fileRows = flatten(buildTree(m.files), 0, m.collapsed, nil)
+		g.header.children = root.children
+		m.fileRows = append(m.fileRows, fileRow{node: g.header})
+		if !m.collapsed[g.header.key] {
+			m.fileRows = flatten(root, 1, m.collapsed, m.fileRows)
+		}
 	}
 	cursor := min(m.fileList.cursor, max(0, len(m.fileRows)-1))
 	for i, r := range m.fileRows {

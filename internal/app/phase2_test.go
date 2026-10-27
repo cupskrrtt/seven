@@ -316,14 +316,21 @@ func TestChangelists(t *testing.T) {
 	press(t, m, "n")
 	typeText(t, m, "wip")
 	press(t, m, "enter")
-	assertScreen(t, m, "Moved a.txt to changelist wip", "a.txt [wip]")
+	// Files are grouped under their changelist; the rest go under "Changes".
+	assertScreen(t, m, "Moved a.txt to changelist wip", "▼ changelist wip (1)", "▼ Changes (1)")
+	if got := rowNames(m.fileRows); got != "wip/\n  a.txt\nChanges/\n  b.txt" {
+		t.Fatalf("rows:\n%s", got)
+	}
 
 	// b.txt can now join the existing changelist via its number.
 	selectFile(t, m, "b.txt")
 	press(t, m, "L")
 	assertScreen(t, m, "Move to wip")
 	press(t, m, "1")
-	assertScreen(t, m, "b.txt [wip]")
+	assertScreen(t, m, "▼ changelist wip (2)")
+	if strings.Contains(screen(m), "Changes") {
+		t.Fatal("empty Changes section should disappear")
+	}
 
 	press(t, m, "L", "s")
 	assertScreen(t, m, "Selected 2 file(s) in wip")
@@ -331,6 +338,19 @@ func TestChangelists(t *testing.T) {
 	assertScreen(t, m, "Commit 2 file(s)")
 	press(t, m, "esc")
 
+	// A changelist header: space toggles the whole list, enter folds it,
+	// and the main view shows the combined diff.
+	press(t, m, "A", "g") // clear the selection, go to the header
+	assertScreen(t, m, "Diff · changelist wip", "+LOCAL", "+new")
+	press(t, m, " ")
+	if len(m.selected) != 2 {
+		t.Fatalf("header space selected %v", m.selected)
+	}
+	press(t, m, "g", "enter")
+	assertScreen(t, m, "▶ changelist wip (2)")
+	press(t, m, "enter")
+
+	selectFile(t, m, "b.txt")
 	press(t, m, "L", "x")
-	assertScreen(t, m, "Removed b.txt from wip")
+	assertScreen(t, m, "Removed b.txt from wip", "▼ Changes (1)")
 }

@@ -92,6 +92,9 @@ func run(path, configPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := app.CheckKeybindings(cfg.Keybindings); err != nil {
+		return fmt.Errorf("%s: %w", configPath, err)
+	}
 	t := cfg.Theme
 	style.SetColors(style.Colors{Accent: t.Accent, Green: t.Green, Red: t.Red, Yellow: t.Yellow,
 		Cyan: t.Cyan, Magenta: t.Magenta, Muted: t.Muted, SelectedBg: t.SelectedBg})
@@ -116,7 +119,8 @@ func run(path, configPath string) error {
 		client.Dir = info.WCRoot
 	}
 
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	// Focus reports let seven refresh when you come back from an editor or shell.
+	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithReportFocus()}
 	if cfg.MouseEnabled() {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}

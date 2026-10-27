@@ -28,6 +28,11 @@ type Config struct {
 	Theme Theme `yaml:"theme"`
 	// Remap translates keys before seven sees them: {"your key": "seven key"}.
 	Remap map[string]string `yaml:"remap"`
+	// Keybindings rebinds actions by name: {context: {action: key}}, e.g.
+	// {files: {commit: "ctrl+s"}}. The help screen (?) lists every name.
+	Keybindings map[string]map[string]string `yaml:"keybindings"`
+	// SideBySide starts diffs in side-by-side mode.
+	SideBySide bool `yaml:"sideBySide"`
 	// CustomCommands bind keys to shell commands.
 	CustomCommands []CustomCommand `yaml:"customCommands"`
 }
@@ -139,9 +144,20 @@ theme:
   muted: ""
   selectedBg: ""
 
-# Remap keys: "your key": "seven key".
+# Start diffs side by side (toggle with v).
+sideBySide: false
+
+# Rebind actions by name; the help screen (?) shows every context.action.
+# The old key stops working in that context.
+keybindings:
+  # files:
+  #   commit: "ctrl+s"
+  # global:
+  #   quit: "Q"
+
+# Lower-level remap: "your key": "seven key" (the old key keeps working).
 remap:
-  # "ctrl+s": "c"   # commit with ctrl+s
+  # "ctrl+p": "?"
 
 # Custom commands. command is a Go template with:
 #   {{.File}} {{.Files}} {{.Dir}} {{.URL}} {{.RepoRoot}} {{.Branch}}

@@ -189,6 +189,16 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 // handleDirKey applies folder actions to everything below dir.
 func (m *Model) handleDirKey(dir *treeNode, key string) tea.Cmd {
 	under := filesUnder(dir)
+	if dir.group {
+		switch key {
+		case "d":
+			m.confirmDiscardAll(groupLabel(dir), under)
+			return nil
+		case "l", "P", "b", "L", "R", "e", "D", "i", "K":
+			m.status = "Not available on a changelist — pick a file inside it"
+			return nil
+		}
+	}
 	switch key {
 	case "enter":
 		m.collapsed[dir.key] = !m.collapsed[dir.key]
@@ -279,6 +289,14 @@ func (m *Model) confirmDiscardAll(label string, files []svn.FileStatus) {
 		}
 		return withBackup(fmt.Sprintf("Discarded %d item(s) under %s", len(all), label), dir), nil
 	})}
+}
+
+// groupLabel names a changelist section: "changelist wip" or "Changes".
+func groupLabel(n *treeNode) string {
+	if n.key == "cl:" {
+		return n.name
+	}
+	return "changelist " + n.name
 }
 
 // committable reports whether f has a local change svn commit would send.
@@ -527,10 +545,8 @@ func statusCode(f svn.FileStatus) string {
 }
 
 func fileSuffix(f svn.FileStatus) string {
+	// The changelist is shown by the section the file is listed under.
 	var s string
-	if f.Changelist != "" {
-		s += style.Dim.Render(" [" + f.Changelist + "]")
-	}
 	warn := lipgloss.NewStyle().Foreground(style.Yellow)
 	switch {
 	case f.Locked:
@@ -572,6 +588,10 @@ func (m *Model) dirLine(n *treeNode, dirStyle lipgloss.Style) string {
 	arrow := "▼"
 	if m.collapsed[n.key] {
 		arrow = "▶"
+	}
+	if n.group {
+		label := lipgloss.NewStyle().Foreground(style.Magenta).Bold(true).Render(groupLabel(n))
+		return fmt.Sprintf("%s %s %s", arrow, label, style.Dim.Render(fmt.Sprintf("(%d)", len(filesUnder(n)))))
 	}
 	line := arrow + " "
 	if n.file != nil {

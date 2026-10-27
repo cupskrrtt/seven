@@ -82,7 +82,7 @@ type Model struct {
 	mainFile    string // file whose diff is shown; enables hunk revert
 	mainHunks   []svn.DiffHunk
 	mainHunk    int // selected hunk, -1 for none
-	mainScroll  int // index into mainVisible
+	mainScroll  int // index into mainRows
 	mainHScroll int
 
 	mainSections  []diffSection // per-file sections of a multi-file diff
@@ -90,6 +90,7 @@ type Model struct {
 	mainFolded    map[int]bool  // folded sections
 	mainCurFile   int           // section that z / } / { act on, -1 if none
 	mainVisible   []int         // raw lines shown after folding
+	mainRows      []diffRow     // screen rows built from mainVisible
 	mainSearch    string
 	mainSearchRe  *regexp.Regexp
 	mainMatches   []int // raw lines matching the search
@@ -109,9 +110,14 @@ type Model struct {
 	backupRoot       string        // overrides the backup directory (tests)
 	shelfRoot        string        // overrides the shelf directory (tests)
 
-	editor string
-	remap  map[string]string
-	custom []config.CustomCommand
+	editor     string
+	remap      map[string]string
+	keys       *keymap
+	custom     []config.CustomCommand
+	sideBySide bool // render diffs in two columns
+
+	lastCommand string // last ':' command, offered again
+	commandRuns int
 
 	popup  popup
 	status string
@@ -138,7 +144,9 @@ func New(client *svn.Client, cfg *config.Config) *Model {
 		editor:        cfg.Editor,
 		remap:         cfg.Remap,
 		custom:        cfg.CustomCommands,
+		sideBySide:    cfg.SideBySide,
 	}
+	m.keys, _ = newKeymap(cfg.Keybindings) // validated up front by CheckKeybindings
 	switch {
 	case cfg.RefreshSeconds < 0:
 		m.refreshEvery = 0
@@ -146,6 +154,13 @@ func New(client *svn.Client, cfg *config.Config) *Model {
 		m.refreshEvery = time.Duration(cfg.RefreshSeconds) * time.Second
 	}
 	return m
+}
+
+// CheckKeybindings reports configuration errors in keybindings (unknown
+// contexts or actions, keys bound twice).
+func CheckKeybindings(b map[string]map[string]string) error {
+	_, err := newKeymap(b)
+	return err
 }
 
 // mainMode reports whether a special view (conflict picker, blame,
@@ -181,7 +196,12 @@ func (m *Model) location() svn.Location {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		wasSBS := m.sideBySideActive()
 		m.width, m.height = msg.Width, msg.Height
+		if m.sideBySideActive() != wasSBS {
+			m.buildRows() // crossed the side-by-side width threshold
+		}
+		m.clampMainScroll()
 		return m, nil
 
 	case tickMsg:
@@ -238,6 +258,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			b.cursor = min(b.cursor, max(0, len(msg.entries)-1))
 		}
 		return m, nil
+
+	case commandOutputMsg:
+		return m, m.showCommandOutput(msg)
 
 	case customDoneMsg:
 		if msg.output != "" {
@@ -332,6 +355,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case editorDoneMsg:
 		return m, m.commitFromEditor(msg)
+
+	case tea.FocusMsg:
+		// Back in the terminal: files may have changed in an editor or shell.
+		if m.popup == nil {
+			return m, m.loadStatus()
+		}
+		return m, nil
 	}
 
 	if p := m.popup; p != nil {
@@ -347,6 +377,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		key := k.String()
 		if to, ok := m.remap[key]; ok {
 			key = to
+		}
+		key, ok := m.keys.translate(m.keyContext(), key)
+		if !ok {
+			return m, nil // this key was rebound to something else
 		}
 		return m, m.handleKey(key)
 	}
@@ -410,10 +444,13 @@ func (m *Model) handleKey(key string) tea.Cmd {
 		return m.toggleRemoteStatus()
 	case "B":
 		return m.openBrowser("")
+	case ":":
+		m.commandPrompt()
+		return nil
 	case "q", "ctrl+c":
 		return tea.Quit
 	case "?":
-		m.popup = &helpPopup{lines: helpLines()}
+		m.popup = &helpPopup{lines: m.helpLines()}
 		return nil
 	case "r":
 		m.status = "Refreshed"

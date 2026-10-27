@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,7 +16,42 @@ import (
 	"github.com/cupskrrtt/seven/internal/svn"
 )
 
-var version = "dev"
+// version is set by release builds via -ldflags "-X main.version=v1.2.3".
+var version = ""
+
+// resolveVersion reports the release version if stamped, else the module
+// version recorded by `go install ...@v1.2.3`, else the VCS commit of a
+// local build.
+func resolveVersion() string {
+	if version != "" {
+		return version
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	if v := bi.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	var rev, modified string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				modified = ", modified"
+			}
+		}
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if rev == "" {
+		return "dev"
+	}
+	return fmt.Sprintf("dev (%s%s)", rev, modified)
+}
 
 func main() {
 	path := flag.String("path", ".", "path to an svn working copy")
@@ -23,7 +59,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("seven", version)
+		fmt.Println("seven", resolveVersion())
 		return
 	}
 	if err := run(*path); err != nil {

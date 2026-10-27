@@ -17,6 +17,9 @@ var helpSections = []struct {
 		{"r", "refresh"},
 		{"u", "update to HEAD"},
 		{"U", "update to revision"},
+		{"x", "actions: cleanup, relocate, shelves, browser, …"},
+		{"*", "toggle incoming changes (svn status -u)"},
+		{"B", "repository browser"},
 		{"@", "toggle command log"},
 		{"?", "this help"},
 		{"q", "quit"},
@@ -40,6 +43,12 @@ var helpSections = []struct {
 		{"enter", "on a conflicted file: hunk picker"},
 		{"e", "open file in editor"},
 		{"w", "toggle ignore whitespace in diff"},
+		{"S", "shelves: shelve changes / pop / apply / drop"},
+		{"K", "lock / unlock (break someone else's lock)"},
+		{"P", "properties of file or folder"},
+	}},
+	{"Status", [][2]string{
+		{"P", "properties of the working-copy root"},
 	}},
 	{"Branches", [][2]string{
 		{"space", "switch working copy to branch / tag"},
@@ -73,6 +82,20 @@ var helpSections = []struct {
 		{"h / l", "pan left / right"},
 		{"g / G", "top / bottom"},
 		{"esc", "back to panel"},
+	}},
+	{"Properties", [][2]string{
+		{"e / enter", "edit value in $EDITOR"},
+		{"a", "add (svn:ignore, svn:externals, … or custom)"},
+		{"d", "delete"},
+	}},
+	{"Repository browser", [][2]string{
+		{"enter / l", "open folder / view file (then / to search)"},
+		{"h / backspace", "parent folder"},
+		{"R", "browse at a revision"},
+		{"L", "log of the entry"},
+		{"x / c", "export / check out"},
+		{"K", "lock / unlock file"},
+		{"P", "properties (read-only)"},
 	}},
 	{"Blame", [][2]string{
 		{"j / k", "move"},

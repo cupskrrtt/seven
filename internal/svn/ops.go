@@ -133,11 +133,19 @@ func (c *Client) RemoveChangelist(ctx context.Context, paths ...string) error {
 // ErrPatchRejected is returned when svn patch could not apply every hunk.
 var ErrPatchRejected = errors.New("patch did not apply cleanly")
 
-// Patch applies a unified diff file to the working copy root; reverse
-// undoes the changes it describes instead.
-func (c *Client) Patch(ctx context.Context, patchFile string, reverse bool) (string, error) {
+// PatchOptions controls Patch.
+type PatchOptions struct {
+	Reverse bool // undo the changes the patch describes
+	Strip   int  // leading path components to remove (see DiffGit)
+}
+
+// Patch applies a unified or git-format diff file to the working copy root.
+func (c *Client) Patch(ctx context.Context, patchFile string, opts PatchOptions) (string, error) {
 	args := []string{"patch"}
-	if reverse {
+	if opts.Strip > 0 {
+		args = append(args, "--strip", strconv.Itoa(opts.Strip))
+	}
+	if opts.Reverse {
 		args = append(args, "--reverse-diff")
 	}
 	out, err := c.Run(ctx, append(args, patchFile)...)

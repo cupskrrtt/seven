@@ -57,20 +57,34 @@ func (i Item) Code() string {
 
 // FileStatus is one entry from `svn status`.
 type FileStatus struct {
-	Path          string
-	Item          Item
-	Props         Item
-	TreeConflict  bool
-	Copied        bool
-	Locked        bool
-	Changelist    string
-	Revision      int
-	RemoteChanged bool // only set by StatusRemote
+	Path         string
+	Item         Item
+	Props        Item
+	TreeConflict bool
+	Copied       bool
+	Locked       bool // this working copy holds a lock token
+	Changelist   string
+	Revision     int
+
+	// Only set by StatusRemote:
+	RemoteChanged   bool // a newer version exists in the repository
+	RemoteItem      Item // what happened there: modified, added, deleted…
+	RemoteLockOwner string
 }
 
 // Conflicted reports whether the path has any kind of conflict.
 func (f FileStatus) Conflicted() bool {
 	return f.Item == ItemConflicted || f.Props == ItemConflicted || f.TreeConflict
+}
+
+// LocalChange reports whether the working copy itself changed the path
+// (as opposed to an entry listed only for an incoming change or a lock).
+func (f FileStatus) LocalChange() bool {
+	switch f.Item {
+	case ItemNormal, ItemNone, "":
+		return f.Props == ItemModified || f.Props == ItemConflicted || f.TreeConflict
+	}
+	return true
 }
 
 // Versioned reports whether the path is under version control.
@@ -90,12 +104,18 @@ type xmlEntry struct {
 	} `xml:"wc-status"`
 	ReposStatus *struct {
 		Item string `xml:"item,attr"`
+		Lock *struct {
+			Owner string `xml:"owner"`
+		} `xml:"lock"`
 	} `xml:"repos-status"`
 }
 
 type xmlStatus struct {
 	Targets []struct {
 		Entries []xmlEntry `xml:"entry"`
+		Against *struct {
+			Revision int `xml:"revision,attr"`
+		} `xml:"against"`
 	} `xml:"target"`
 	Changelists []struct {
 		Name    string     `xml:"name,attr"`
@@ -114,8 +134,13 @@ func (e xmlEntry) toStatus(changelist string) FileStatus {
 		Locked:       e.WCStatus.Lock != nil,
 		Changelist:   changelist,
 	}
-	if e.ReposStatus != nil && e.ReposStatus.Item != "none" && e.ReposStatus.Item != "" {
-		fs.RemoteChanged = true
+	if r := e.ReposStatus; r != nil {
+		if r.Item != "none" && r.Item != "" {
+			fs.RemoteChanged, fs.RemoteItem = true, Item(r.Item)
+		}
+		if r.Lock != nil {
+			fs.RemoteLockOwner = r.Lock.Owner
+		}
 	}
 	return fs
 }
@@ -131,7 +156,7 @@ func ParseStatus(data []byte) ([]FileStatus, error) {
 	add := func(e xmlEntry, cl string) {
 		fs := e.toStatus(cl)
 		if fs.Item == ItemNormal && (fs.Props == ItemNormal || fs.Props == ItemNone) &&
-			!fs.TreeConflict && !fs.RemoteChanged && !fs.Locked && cl == "" {
+			!fs.TreeConflict && !fs.RemoteChanged && !fs.Locked && fs.RemoteLockOwner == "" && cl == "" {
 			return
 		}
 		files = append(files, fs)
@@ -175,4 +200,28 @@ func (c *Client) Status(ctx context.Context) ([]FileStatus, error) {
 		return nil, err
 	}
 	return ParseStatus(out)
+}
+
+// StatusRemote is Status plus what changed in the repository since the
+// working copy was updated (svn status -u). It contacts the server and
+// returns the HEAD revision compared against.
+func (c *Client) StatusRemote(ctx context.Context) ([]FileStatus, int, error) {
+	out, err := c.Run(ctx, "status", "-u", "--xml")
+	if err != nil {
+		return nil, 0, err
+	}
+	files, err := ParseStatus(out)
+	if err != nil {
+		return nil, 0, err
+	}
+	var x xmlStatus
+	against := 0
+	if xml.Unmarshal(out, &x) == nil {
+		for _, t := range x.Targets {
+			if t.Against != nil {
+				against = t.Against.Revision
+			}
+		}
+	}
+	return files, against, nil
 }

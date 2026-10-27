@@ -287,7 +287,7 @@ func TestRevertSingleHunk(t *testing.T) {
 	}
 	pf := filepath.Join(t.TempDir(), "h.patch")
 	write(t, pf, patch)
-	if _, err := c.Patch(ctx, pf, true); err != nil {
+	if _, err := c.Patch(ctx, pf, PatchOptions{Reverse: true}); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(filepath.Join(c.Dir, "a.txt"))

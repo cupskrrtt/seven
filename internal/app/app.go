@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/cupskrrtt/seven/internal/config"
 	"github.com/cupskrrtt/seven/internal/svn"
 	"github.com/cupskrrtt/seven/internal/ui/style"
 )
@@ -96,11 +97,21 @@ type Model struct {
 
 	conflict *conflictView // non-nil while the hunk picker owns the main view
 	blame    *blameView    // non-nil while blame owns the main view
+	props    *propsView    // non-nil while the property editor owns the main view
+	browser  *browserView  // non-nil while the repository browser owns the main view
+
+	remoteStatus bool // include incoming changes (svn status -u)
+	against      int  // HEAD revision the last remote status compared with
 
 	ignoreWhitespace bool
 	showCmdLog       bool
 	refreshEvery     time.Duration // status auto-refresh; 0 disables
 	backupRoot       string        // overrides the backup directory (tests)
+	shelfRoot        string        // overrides the shelf directory (tests)
+
+	editor string
+	remap  map[string]string
+	custom []config.CustomCommand
 
 	popup  popup
 	status string
@@ -108,9 +119,12 @@ type Model struct {
 	width, height int
 }
 
-// New returns a model for the working copy client points at.
-func New(client *svn.Client) *Model {
-	return &Model{
+// New returns a model for the working copy client points at; cfg may be nil.
+func New(client *svn.Client, cfg *config.Config) *Model {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	m := &Model{
 		client:        client,
 		selected:      map[string]bool{},
 		collapsed:     map[string]bool{},
@@ -120,7 +134,24 @@ func New(client *svn.Client) *Model {
 		branchesStale: true,
 		mainHunk:      -1,
 		refreshEvery:  defaultRefresh,
+		flatFiles:     cfg.FlatFileList,
+		editor:        cfg.Editor,
+		remap:         cfg.Remap,
+		custom:        cfg.CustomCommands,
 	}
+	switch {
+	case cfg.RefreshSeconds < 0:
+		m.refreshEvery = 0
+	case cfg.RefreshSeconds > 0:
+		m.refreshEvery = time.Duration(cfg.RefreshSeconds) * time.Second
+	}
+	return m
+}
+
+// mainMode reports whether a special view (conflict picker, blame,
+// properties, browser) owns the main view.
+func (m *Model) mainMode() bool {
+	return m.conflict != nil || m.blame != nil || m.props != nil || m.browser != nil
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -184,8 +215,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case statusMsg:
+		if msg.against > 0 {
+			m.against = msg.against
+			m.head = max(m.head, msg.against) // fresher than the last info
+		}
 		m.applyStatus(msg.files)
 		return m, m.syncMain()
+
+	case propsMsg:
+		if m.props != nil && m.props.target == msg.target {
+			m.props.props, m.props.loading = msg.props, false
+			m.props.cursor = min(m.props.cursor, max(0, len(msg.props)-1))
+		}
+		return m, nil
+
+	case propEditedMsg:
+		return m, m.finishPropEdit(msg)
+
+	case listMsg:
+		if b := m.browser; b != nil && b.url == msg.url && b.rev == msg.rev {
+			b.entries, b.loading = msg.entries, false
+			b.cursor = min(b.cursor, max(0, len(msg.entries)-1))
+		}
+		return m, nil
+
+	case customDoneMsg:
+		if msg.output != "" {
+			m.popup = &messagePopup{heading: msg.title, text: msg.output, isError: msg.failed}
+		}
+		m.status = msg.status
+		return m, m.refresh()
+
+	case tea.MouseMsg:
+		if m.popup != nil {
+			return m, nil
+		}
+		return m, m.handleMouse(msg)
 
 	case branchesMsg:
 		m.branchesLoading = false
@@ -232,7 +297,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reloadConflict() // e.g. after editing the file in $EDITOR
 		}
 		m.mainKey = "" // whatever is shown may have changed
-		return m, m.refresh()
+		cmds := []tea.Cmd{m.refresh()}
+		if m.props != nil {
+			cmds = append(cmds, m.loadProps(m.props.target))
+		}
+		if m.browser != nil && !m.browser.viewing {
+			cmds = append(cmds, m.loadListing())
+		}
+		return m, tea.Batch(cmds...)
 
 	case errMsg:
 		m.logLoading = false
@@ -272,7 +344,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if k, ok := msg.(tea.KeyMsg); ok {
-		return m, m.handleKey(k)
+		key := k.String()
+		if to, ok := m.remap[key]; ok {
+			key = to
+		}
+		return m, m.handleKey(key)
 	}
 	return m, nil
 }
@@ -281,8 +357,8 @@ func (m *Model) setFocus(p panel) tea.Cmd {
 	m.focus = p
 	if p != panelMain {
 		m.lastLeft = p
-		if m.conflict != nil || m.blame != nil {
-			m.conflict, m.blame = nil, nil
+		if m.mainMode() {
+			m.conflict, m.blame, m.props, m.browser = nil, nil, nil, nil
 			m.mainKey = "" // reload whatever the panel shows
 		}
 	}
@@ -298,20 +374,28 @@ func (m *Model) cycleFocus(step int) tea.Cmd {
 	return m.setFocus(panelFiles)
 }
 
-func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
-	key := k.String()
-
+func (m *Model) handleKey(key string) tea.Cmd {
 	// Main-view modes take precedence over global keys except quit/help.
 	if m.focus == panelMain && key != "q" && key != "ctrl+c" && key != "?" {
-		if m.conflict != nil {
-			if handled, cmd := m.handleConflictKey(key); handled {
-				return cmd
-			}
-		} else if m.blame != nil {
-			if handled, cmd := m.handleBlameKey(key); handled {
-				return cmd
-			}
+		var handled bool
+		var cmd tea.Cmd
+		switch {
+		case m.conflict != nil:
+			handled, cmd = m.handleConflictKey(key)
+		case m.blame != nil:
+			handled, cmd = m.handleBlameKey(key)
+		case m.props != nil:
+			handled, cmd = m.handlePropsKey(key)
+		case m.browser != nil:
+			handled, cmd = m.handleBrowserKey(key)
 		}
+		if handled {
+			return cmd
+		}
+	}
+	// User-defined commands win over built-in keys in their context.
+	if cmd, ok := m.runCustom(key); ok {
+		return cmd
 	}
 	// Panel keys that shadow global ones.
 	if m.focus == panelLog && key == "U" {
@@ -319,6 +403,13 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	}
 
 	switch key {
+	case "x":
+		m.actionsMenu()
+		return nil
+	case "*":
+		return m.toggleRemoteStatus()
+	case "B":
+		return m.openBrowser("")
 	case "q", "ctrl+c":
 		return tea.Quit
 	case "?":
@@ -363,8 +454,11 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	case panelMain:
 		return m.handleMainKey(key)
 	case panelStatus:
-		if key == "enter" {
+		switch key {
+		case "enter":
 			return m.setFocus(panelMain)
+		case "P":
+			return m.openProps(".")
 		}
 	}
 	return nil
@@ -415,8 +509,13 @@ type editorDoneMsg struct {
 	err   error
 }
 
-func editorCommand(path string) *exec.Cmd {
-	editor := os.Getenv("SVN_EDITOR")
+// editorCommand opens path in the configured editor, falling back to
+// $SVN_EDITOR, $VISUAL, $EDITOR, then notepad / vi.
+func (m *Model) editorCommand(path string) *exec.Cmd {
+	editor := m.editor
+	if editor == "" {
+		editor = os.Getenv("SVN_EDITOR")
+	}
 	if editor == "" {
 		editor = os.Getenv("VISUAL")
 	}
@@ -436,7 +535,7 @@ func editorCommand(path string) *exec.Cmd {
 }
 
 func (m *Model) openEditor(path string) tea.Cmd {
-	return tea.ExecProcess(editorCommand(path), func(err error) tea.Msg {
+	return tea.ExecProcess(m.editorCommand(path), func(err error) tea.Msg {
 		if err != nil {
 			return errMsg{err}
 		}
@@ -500,6 +599,10 @@ func (m *Model) View() string {
 		right = m.conflictBox(rw, m.mainHeight())
 	case m.blame != nil:
 		right = m.blameBox(rw, m.mainHeight())
+	case m.props != nil:
+		right = m.propsBox(rw, m.mainHeight())
+	case m.browser != nil && !m.browser.viewing:
+		right = m.browserBox(rw, m.mainHeight())
 	default:
 		right = m.mainBox(rw, m.mainHeight())
 	}
@@ -526,6 +629,15 @@ func (m *Model) statusLines(w int) []string {
 			fmt.Sprintf(" ↓%d behind HEAD r%d", m.head-m.info.Revision, m.head))
 	} else if m.head > 0 {
 		rev += style.Dim.Render(" (up to date)")
+	}
+	if m.remoteStatus {
+		n := 0
+		for _, f := range m.files {
+			if f.RemoteChanged {
+				n++
+			}
+		}
+		rev += lipgloss.NewStyle().Foreground(style.Yellow).Render(fmt.Sprintf(" · %d incoming", n))
 	}
 	return []string{
 		" " + lipgloss.NewStyle().Foreground(style.Green).Bold(true).Render(loc.String()),
@@ -569,6 +681,12 @@ func (m *Model) bottomBar() string {
 		hints = "n/p next/prev conflict · m mine · t theirs · b both · B base · z undo · e edit · esc back"
 	case m.focus == panelMain && m.blame != nil:
 		hints = "j/k move · enter show revision · esc back"
+	case m.focus == panelMain && m.props != nil:
+		hints = "e edit value · a add · d delete · j/k move · esc back"
+	case m.focus == panelMain && m.browser != nil && m.browser.viewing:
+		hints = "/ search · j/k scroll · esc back to listing"
+	case m.focus == panelMain && m.browser != nil:
+		hints = "enter open · h up · R revision · L log · x export · c checkout · K lock · P props · esc close"
 	case m.focus == panelMain && m.mainSearch != "":
 		hints = "n/N next/prev match · / new search · esc clear search"
 	case m.focus == panelMain && m.mainFile != "" && len(m.mainHunks) > 0:
@@ -578,13 +696,13 @@ func (m *Model) bottomBar() string {
 	case m.focus == panelMain:
 		hints = "/ search · j/k scroll · ctrl+d/u page · h/l pan · esc back"
 	case m.focus == panelFiles:
-		hints = "space select · c commit · a add · d discard · enter fold · ` tree/flat · b blame · l log · L changelist"
+		hints = "space select · c commit · a add · d discard · enter fold · b blame · l log · S shelve · K lock · P props · x more"
 	case m.focus == panelBranches:
 		hints = "space switch · n new branch · t new tag · m merge · e unmerged · enter log · D delete"
 	case m.focus == panelLog:
 		hints = "c cherry-pick · R revert rev · U update to rev · / filter · s stop-on-copy · esc reset"
 	default:
-		hints = "enter details · u update"
+		hints = "enter details · u update · P root properties · * incoming · B browse repo · x actions"
 	}
 	hints += " · ? help · q quit"
 	bar := style.Dim.Render(hints)

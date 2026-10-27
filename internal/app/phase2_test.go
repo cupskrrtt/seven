@@ -168,7 +168,7 @@ func TestRevertHunk(t *testing.T) {
 	selectFile(t, m, "h.txt")
 	press(t, m, "enter")
 	press(t, m, "d")
-	assertScreen(t, m, "Select a hunk with n/p first")
+	assertScreen(t, m, "Select a hunk with ] / [ first")
 	press(t, m, "n", "n")
 	assertScreen(t, m, "hunk 2/2")
 	press(t, m, "d")

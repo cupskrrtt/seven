@@ -21,7 +21,10 @@ type infoMsg struct {
 	head int
 }
 
-type statusMsg struct{ files []svn.FileStatus }
+type statusMsg struct {
+	files   []svn.FileStatus
+	against int // HEAD revision for a remote status, else 0
+}
 
 type logMsg struct {
 	gen    int // matches Model.logGen when the request was made
@@ -89,12 +92,20 @@ func (m *Model) loadInfo() tea.Cmd {
 }
 
 func (m *Model) loadStatus() tea.Cmd {
+	remote := m.remoteStatus
 	return m.svnCmd(func(ctx context.Context) tea.Msg {
+		if remote {
+			files, against, err := m.client.StatusRemote(ctx)
+			if err != nil {
+				return errMsg{err}
+			}
+			return statusMsg{files: files, against: against}
+		}
 		files, err := m.client.Status(ctx)
 		if err != nil {
 			return errMsg{err}
 		}
-		return statusMsg{files}
+		return statusMsg{files: files}
 	})
 }
 

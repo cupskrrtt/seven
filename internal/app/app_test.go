@@ -51,9 +51,10 @@ func setup(t *testing.T) (*Model, string) {
 	if err != nil {
 		t.Skip(err)
 	}
-	m := New(client)
+	m := New(client, nil)
 	m.refreshEvery = 0
 	m.backupRoot = filepath.Join(root, "backups")
+	m.shelfRoot = filepath.Join(root, "shelves")
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	drain(t, m, m.Init())
 	return m, url + "/trunk"
@@ -106,6 +107,8 @@ func press(t *testing.T, m *Model, keys ...string) {
 			msg = tea.KeyMsg{Type: tea.KeyEsc}
 		case "tab":
 			msg = tea.KeyMsg{Type: tea.KeyTab}
+		case "backspace":
+			msg = tea.KeyMsg{Type: tea.KeyBackspace}
 		default:
 			msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 		}

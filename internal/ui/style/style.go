@@ -11,24 +11,65 @@ import (
 	"github.com/cupskrrtt/seven/internal/svn"
 )
 
+// Colours; adaptive defaults pick a light or dark variant for the terminal.
 var (
-	Accent   = lipgloss.AdaptiveColor{Light: "#0b6bcb", Dark: "#5fafff"}
-	Muted    = lipgloss.AdaptiveColor{Light: "#6b6b6b", Dark: "#8a8a8a"}
-	Green    = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#56d364"}
-	Red      = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#ff7b72"}
-	Yellow   = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#e3b341"}
-	Cyan     = lipgloss.AdaptiveColor{Light: "#1b7c83", Dark: "#56d4dd"}
-	Magenta  = lipgloss.AdaptiveColor{Light: "#8250df", Dark: "#d2a8ff"}
-	SelectBG = lipgloss.AdaptiveColor{Light: "#dbe9f9", Dark: "#264f78"}
-
-	Bold      = lipgloss.NewStyle().Bold(true)
-	Dim       = lipgloss.NewStyle().Foreground(Muted)
-	Selected  = lipgloss.NewStyle().Background(SelectBG)
-	Title     = lipgloss.NewStyle().Foreground(Accent).Bold(true)
-	ErrorText = lipgloss.NewStyle().Foreground(Red)
-	Key       = lipgloss.NewStyle().Foreground(Accent)
-	Current   = lipgloss.NewStyle().Foreground(Yellow).Bold(true).Underline(true)
+	Accent   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#0b6bcb", Dark: "#5fafff"}
+	Muted    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#6b6b6b", Dark: "#8a8a8a"}
+	Green    lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#56d364"}
+	Red      lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#ff7b72"}
+	Yellow   lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#e3b341"}
+	Cyan     lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#1b7c83", Dark: "#56d4dd"}
+	Magenta  lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#8250df", Dark: "#d2a8ff"}
+	SelectBG lipgloss.TerminalColor = lipgloss.AdaptiveColor{Light: "#dbe9f9", Dark: "#264f78"}
 )
+
+// Styles derived from the colours; rebuilt by SetColors.
+var (
+	Bold      = lipgloss.NewStyle().Bold(true)
+	Dim       lipgloss.Style
+	Selected  lipgloss.Style
+	Title     lipgloss.Style
+	ErrorText lipgloss.Style
+	Key       lipgloss.Style
+	Current   lipgloss.Style
+	Match     lipgloss.Style // search hits
+)
+
+func init() { rebuild() }
+
+func rebuild() {
+	Dim = lipgloss.NewStyle().Foreground(Muted)
+	Selected = lipgloss.NewStyle().Background(SelectBG)
+	Title = lipgloss.NewStyle().Foreground(Accent).Bold(true)
+	ErrorText = lipgloss.NewStyle().Foreground(Red)
+	Key = lipgloss.NewStyle().Foreground(Accent)
+	Current = lipgloss.NewStyle().Foreground(Yellow).Bold(true).Underline(true)
+	Match = lipgloss.NewStyle().Background(Yellow).Foreground(lipgloss.Color("#000000"))
+}
+
+// Colors are theme overrides; empty fields keep the defaults. Values are
+// anything lipgloss.Color accepts: "#rrggbb" or an ANSI number.
+type Colors struct {
+	Accent, Green, Red, Yellow, Cyan, Magenta, Muted, SelectedBg string
+}
+
+// SetColors applies theme overrides and rebuilds the styles.
+func SetColors(c Colors) {
+	set := func(dst *lipgloss.TerminalColor, v string) {
+		if v != "" {
+			*dst = lipgloss.Color(v)
+		}
+	}
+	set(&Accent, c.Accent)
+	set(&Green, c.Green)
+	set(&Red, c.Red)
+	set(&Yellow, c.Yellow)
+	set(&Cyan, c.Cyan)
+	set(&Magenta, c.Magenta)
+	set(&Muted, c.Muted)
+	set(&SelectBG, c.SelectedBg)
+	rebuild()
+}
 
 // ItemStyle colours a status code.
 func ItemStyle(f svn.FileStatus) lipgloss.Style {
@@ -67,9 +108,6 @@ func diffStyle(k svn.LineKind) lipgloss.Style {
 func DiffLine(l svn.DiffLine) string {
 	return diffStyle(l.Kind).Render(ExpandTabs(l.Text))
 }
-
-// Match is the highlight for search hits.
-var Match = lipgloss.NewStyle().Background(Yellow).Foreground(lipgloss.Color("#000000"))
 
 // DiffLineHighlight renders l like DiffLine with every match of re
 // highlighted; current marks the line holding the selected match.

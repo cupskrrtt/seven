@@ -72,6 +72,9 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 		return m.startCommit(false)
 	case "C":
 		return m.startCommit(true)
+	case "S":
+		m.shelvesMenu()
+		return nil
 	}
 	if dir, ok := m.currentDir(); ok {
 		return m.handleDirKey(dir, key)
@@ -89,6 +92,10 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 
 	switch key {
 	case " ":
+		if !committable(f) && !m.selected[f.Path] {
+			m.status = f.Path + " has no local change to commit"
+			return nil
+		}
 		if m.selected[f.Path] {
 			delete(m.selected, f.Path)
 		} else {
@@ -102,7 +109,7 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 		m.selected = map[string]bool{}
 		if all {
 			for _, f := range m.files {
-				if f.Versioned() {
+				if committable(f) {
 					m.selected[f.Path] = true
 				}
 			}
@@ -163,6 +170,18 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 			return nil
 		}
 		m.changelistMenu(f)
+	case "K":
+		if !f.Versioned() || f.Item == svn.ItemAdded {
+			m.status = "Only committed files can be locked"
+			return nil
+		}
+		m.lockMenu(f)
+	case "P":
+		if !f.Versioned() {
+			m.status = "Unversioned files have no properties"
+			return nil
+		}
+		return m.openProps(f.Path)
 	}
 	return nil
 }
@@ -179,12 +198,12 @@ func (m *Model) handleDirKey(dir *treeNode, key string) tea.Cmd {
 		// Select every versioned change below; if all are selected, clear them.
 		all := true
 		for _, f := range under {
-			if f.Versioned() && !m.selected[f.Path] {
+			if committable(f) && !m.selected[f.Path] {
 				all = false
 			}
 		}
 		for _, f := range under {
-			if !f.Versioned() {
+			if !committable(f) {
 				continue
 			}
 			if all {
@@ -213,7 +232,9 @@ func (m *Model) handleDirKey(dir *treeNode, key string) tea.Cmd {
 		m.confirmDiscardAll(dir.key+"/", under)
 	case "l":
 		return m.setLogPath(filepath.FromSlash(dir.key))
-	case "b", "L", "R", "e", "D", "i":
+	case "P":
+		return m.openProps(filepath.FromSlash(dir.key))
+	case "b", "L", "R", "e", "D", "i", "K":
 		m.status = "Not available on a folder — expand it (enter) and pick a file"
 	}
 	return nil
@@ -259,6 +280,9 @@ func (m *Model) confirmDiscardAll(label string, files []svn.FileStatus) {
 		return withBackup(fmt.Sprintf("Discarded %d item(s) under %s", len(all), label), dir), nil
 	})}
 }
+
+// committable reports whether f has a local change svn commit would send.
+func committable(f svn.FileStatus) bool { return f.Versioned() && f.LocalChange() }
 
 // confirmRevert asks before discarding f's changes; a backup is saved first.
 func (m *Model) confirmRevert(f svn.FileStatus) {
@@ -372,7 +396,7 @@ func (m *Model) changelistMenu(f svn.FileStatus) {
 func (m *Model) commitTargets() []string {
 	var paths []string
 	for _, f := range m.files {
-		if m.selected[f.Path] || (len(m.selected) == 0 && f.Versioned() && f.Item != svn.ItemNormal) {
+		if m.selected[f.Path] || (len(m.selected) == 0 && committable(f)) {
 			paths = append(paths, f.Path)
 		}
 	}
@@ -430,7 +454,7 @@ func (m *Model) editCommitMessage(paths []string) tea.Cmd {
 	}
 	f.WriteString(b.String())
 	f.Close()
-	return tea.ExecProcess(editorCommand(f.Name()), func(err error) tea.Msg {
+	return tea.ExecProcess(m.editorCommand(f.Name()), func(err error) tea.Msg {
 		return editorDoneMsg{file: f.Name(), paths: paths, err: err}
 	})
 }
@@ -482,6 +506,9 @@ func (m *Model) filesBox(w, h int) string {
 	if n := len(m.selected); n > 0 {
 		title = fmt.Sprintf("[2] Files (%d, %d selected)", len(m.files), n)
 	}
+	if m.remoteStatus {
+		title += fmt.Sprintf(" · vs r%d", m.against)
+	}
 	focused := m.focus == panelFiles
 	return style.Box(title, m.fileList.render(lines, w-2, h-2, focused), w, h, focused)
 }
@@ -504,8 +531,16 @@ func fileSuffix(f svn.FileStatus) string {
 	if f.Changelist != "" {
 		s += style.Dim.Render(" [" + f.Changelist + "]")
 	}
-	if f.Locked {
-		s += style.Dim.Render(" (locked)")
+	warn := lipgloss.NewStyle().Foreground(style.Yellow)
+	switch {
+	case f.Locked:
+		s += warn.Render(" (locked by me)")
+	case f.RemoteLockOwner != "":
+		s += warn.Render(" (locked by " + f.RemoteLockOwner + ")")
+	}
+	if f.RemoteChanged {
+		// Incoming change from the server (svn status -u marks these with *).
+		s += warn.Render(" ↓" + f.RemoteItem.Code())
 	}
 	return s
 }
@@ -515,7 +550,7 @@ func fileSuffix(f svn.FileStatus) string {
 func (m *Model) dirMark(n *treeNode, sel lipgloss.Style) string {
 	total, picked := 0, 0
 	for _, f := range filesUnder(n) {
-		if f.Versioned() {
+		if committable(f) {
 			total++
 			if m.selected[f.Path] {
 				picked++

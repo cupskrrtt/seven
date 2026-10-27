@@ -15,12 +15,18 @@ import (
 // keepBackups is how many backup folders are kept; older ones are pruned.
 const keepBackups = 50
 
-// backupRootDir is where backups go: $XDG_STATE_HOME/seven/backups
-// (~/.local/state/...) on Linux, the per-user app data folder elsewhere.
+// backupRootDir is where backups go: <state dir>/backups.
 func (m *Model) backupRootDir() (string, error) {
 	if m.backupRoot != "" {
 		return m.backupRoot, nil
 	}
+	base, err := stateDir()
+	return filepath.Join(base, "backups"), err
+}
+
+// stateDir holds seven's data (backups, shelves): $XDG_STATE_HOME/seven
+// (~/.local/state/seven) on Linux, the per-user app data folder elsewhere.
+func stateDir() (string, error) {
 	var base string
 	switch runtime.GOOS {
 	case "windows":
@@ -45,7 +51,7 @@ func (m *Model) backupRootDir() (string, error) {
 			base = filepath.Join(home, ".local", "state")
 		}
 	}
-	return filepath.Join(base, "seven", "backups"), nil
+	return filepath.Join(base, "seven"), nil
 }
 
 // backup saves copies of relPaths (files or directories) and, if

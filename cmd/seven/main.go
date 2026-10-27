@@ -13,7 +13,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cupskrrtt/seven/internal/app"
+	"github.com/cupskrrtt/seven/internal/config"
 	"github.com/cupskrrtt/seven/internal/svn"
+	"github.com/cupskrrtt/seven/internal/ui/style"
 )
 
 // version is set by release builds via -ldflags "-X main.version=v1.2.3".
@@ -55,20 +57,45 @@ func resolveVersion() string {
 
 func main() {
 	path := flag.String("path", ".", "path to an svn working copy")
+	configPath := flag.String("config", "", "config file (default: "+defaultConfigPath()+")")
+	printConfig := flag.Bool("print-config", false, "print an example config file and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
-	if *showVersion {
+	switch {
+	case *showVersion:
 		fmt.Println("seven", resolveVersion())
 		return
+	case *printConfig:
+		fmt.Print(config.Example)
+		return
 	}
-	if err := run(*path); err != nil {
+	if err := run(*path, *configPath); err != nil {
 		fmt.Fprintln(os.Stderr, "seven:", err)
 		os.Exit(1)
 	}
 }
 
-func run(path string) error {
+func defaultConfigPath() string {
+	p, err := config.DefaultPath()
+	if err != nil {
+		return "none"
+	}
+	return p
+}
+
+func run(path, configPath string) error {
+	if configPath == "" {
+		configPath = defaultConfigPath()
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	t := cfg.Theme
+	style.SetColors(style.Colors{Accent: t.Accent, Green: t.Green, Red: t.Red, Yellow: t.Yellow,
+		Cyan: t.Cyan, Magenta: t.Magenta, Muted: t.Muted, SelectedBg: t.SelectedBg})
+
 	dir, err := filepath.Abs(path)
 	if err != nil {
 		return err
@@ -89,6 +116,10 @@ func run(path string) error {
 		client.Dir = info.WCRoot
 	}
 
-	_, err = tea.NewProgram(app.New(client), tea.WithAltScreen()).Run()
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if cfg.MouseEnabled() {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	_, err = tea.NewProgram(app.New(client, cfg), opts...).Run()
 	return err
 }

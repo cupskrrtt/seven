@@ -19,7 +19,7 @@ import (
 func (m *Model) syncMain() tea.Cmd {
 	// The focused main view keeps what it was opened with, unless an
 	// operation invalidated it (mainKey cleared), e.g. after a hunk revert.
-	if m.focus == panelMain && (m.mainKey != "" || m.blame != nil || m.conflict != nil) {
+	if m.focus == panelMain && (m.mainKey != "" || m.mainMode()) {
 		return nil
 	}
 	switch m.lastLeft {
@@ -199,7 +199,7 @@ func (m *Model) confirmRevertHunk() tea.Cmd {
 		return nil
 	}
 	if m.mainHunk < 0 {
-		m.status = "Select a hunk with n/p first"
+		m.status = "Select a hunk with ] / [ first"
 		return nil
 	}
 	h, file := m.mainHunks[m.mainHunk], m.mainFile
@@ -224,7 +224,7 @@ func (m *Model) confirmRevertHunk() tea.Cmd {
 			defer os.Remove(pf.Name())
 			pf.WriteString(patch)
 			pf.Close()
-			if _, err := m.client.Patch(ctx, pf.Name(), true); err != nil {
+			if _, err := m.client.Patch(ctx, pf.Name(), svn.PatchOptions{Reverse: true}); err != nil {
 				return "", err
 			}
 			return withBackup(fmt.Sprintf("Reverted hunk %d of %s", n, file), dir), nil

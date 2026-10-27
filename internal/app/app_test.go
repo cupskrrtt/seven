@@ -190,3 +190,107 @@ func TestLogPanelShowsRevision(t *testing.T) {
 	assertScreen(t, m, "Keybindings")
 	press(t, m, "esc", "q")
 }
+
+// setupConflict returns a model whose working copy has f.txt in a text
+// conflict with two hunks: line 2 and line 7 changed on both sides.
+func setupConflict(t *testing.T) *Model {
+	t.Helper()
+	m, trunk := setup(t)
+	wc := m.client.Dir
+	base := "1\n2\n3\n4\n5\n6\n7\n8\n"
+	os.WriteFile(filepath.Join(wc, "f.txt"), []byte(base), 0o644)
+	sh(t, wc, "svn", "add", "-q", "f.txt")
+	sh(t, wc, "svn", "commit", "-q", "-m", "add f", "f.txt")
+
+	other := filepath.Join(t.TempDir(), "other")
+	sh(t, ".", "svn", "checkout", "-q", trunk, other)
+	os.WriteFile(filepath.Join(other, "f.txt"), []byte("1\nTHEIRS2\n3\n4\n5\n6\nTHEIRS7\n8\n"), 0o644)
+	sh(t, other, "svn", "commit", "-q", "-m", "theirs")
+
+	os.WriteFile(filepath.Join(wc, "f.txt"), []byte("1\nMINE2\n3\n4\n5\n6\nMINE7\n8\n"), 0o644)
+	press(t, m, "u")
+	assertScreen(t, m, "1 conflict(s)", "C   f.txt")
+	if m.files[0].Path != "f.txt" {
+		t.Fatalf("conflicted file should sort first: %+v", m.files)
+	}
+	for _, f := range m.files {
+		if strings.HasPrefix(f.Path, "f.txt.") {
+			t.Fatalf("conflict artifact %s should be hidden", f.Path)
+		}
+	}
+	press(t, m, "g") // the cursor stays on a.txt across refreshes; go to the conflict
+	return m
+}
+
+func readWC(t *testing.T, m *Model, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(m.client.Dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestConflictHunkPicker(t *testing.T) {
+	m := setupConflict(t)
+
+	press(t, m, "enter")
+	assertScreen(t, m, "Conflict · f.txt · 1/2", "← mine (m)", "← theirs (t)", "MINE2", "THEIRS2")
+
+	press(t, m, "m")
+	assertScreen(t, m, "Kept mine for conflict 1", "Conflict · f.txt · 1/1")
+
+	// Undo, then pick differently.
+	press(t, m, "z")
+	assertScreen(t, m, "Conflict · f.txt · 1/2")
+	press(t, m, "b") // both for line 2
+	press(t, m, "t") // theirs for line 7
+	assertScreen(t, m, "All conflicts picked", "Mark it resolved now?")
+	if got, want := readWC(t, m, "f.txt"), "1\nMINE2\nTHEIRS2\n3\n4\n5\n6\nTHEIRS7\n8\n"; got != want {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+
+	press(t, m, "y")
+	assertScreen(t, m, "Resolved f.txt", "M   f.txt")
+	if m.conflict != nil || m.focus != panelFiles {
+		t.Fatalf("picker should close: conflict=%v focus=%v", m.conflict, m.focus)
+	}
+	if _, err := os.Stat(filepath.Join(m.client.Dir, "f.txt.mine")); !os.IsNotExist(err) {
+		t.Errorf("svn resolve should remove artifacts, stat err = %v", err)
+	}
+}
+
+func TestResolveMenuTheirsFull(t *testing.T) {
+	m := setupConflict(t)
+
+	press(t, m, "R")
+	assertScreen(t, m, "Resolve f.txt", "Pick hunks", "Mine (full)", "Theirs (full)", "Mine for conflicts", "Base")
+
+	// Theirs (full) discards local work, so it asks first; esc cancels.
+	press(t, m, "t")
+	assertScreen(t, m, "Discard local changes")
+	press(t, m, "esc")
+	if !m.files[0].Conflicted() {
+		t.Fatal("cancel must leave the conflict alone")
+	}
+
+	press(t, m, "R", "t", "y")
+	assertScreen(t, m, "Took theirs for f.txt")
+	if got := readWC(t, m, "f.txt"); got != "1\nTHEIRS2\n3\n4\n5\n6\nTHEIRS7\n8\n" {
+		t.Fatalf("file = %q", got)
+	}
+	for _, f := range m.files {
+		if f.Path == "f.txt" {
+			t.Fatalf("theirs-full leaves no local change, but status has %+v", f)
+		}
+	}
+}
+
+func TestResolveMenuMineConflict(t *testing.T) {
+	m := setupConflict(t)
+	press(t, m, "R", "M")
+	assertScreen(t, m, "Kept mine (conflicts) for f.txt")
+	if got := readWC(t, m, "f.txt"); got != "1\nMINE2\n3\n4\n5\n6\nMINE7\n8\n" {
+		t.Fatalf("file = %q", got)
+	}
+}

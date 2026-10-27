@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -22,17 +23,22 @@ type popup interface {
 	hint() string
 }
 
-// confirmPopup asks a yes/no question.
+// confirmPopup asks a yes/no question. On yes it returns onYes, or calls
+// onYesFn on the UI goroutine when the action must change model state.
 type confirmPopup struct {
 	heading string
 	text    string
 	onYes   tea.Cmd
+	onYesFn func() tea.Cmd
 }
 
 func (p *confirmPopup) update(msg tea.Msg) (bool, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		switch k.String() {
 		case "y", "enter":
+			if p.onYesFn != nil {
+				return true, p.onYesFn()
+			}
 			return true, p.onYes
 		case "n", "esc", "q":
 			return true, nil
@@ -43,6 +49,55 @@ func (p *confirmPopup) update(msg tea.Msg) (bool, tea.Cmd) {
 func (p *confirmPopup) title() string       { return p.heading }
 func (p *confirmPopup) body(w int) []string { return wrap(p.text, w) }
 func (p *confirmPopup) hint() string        { return "enter/y confirm · esc cancel" }
+
+// menuItem is one entry of a menuPopup. run executes on the UI goroutine,
+// so it may change model state (including opening another popup).
+type menuItem struct {
+	key   string
+	label string
+	desc  string
+	run   func() tea.Cmd
+}
+
+// menuPopup lets the user pick an action by moving or by its shortcut key.
+type menuPopup struct {
+	heading string
+	items   []menuItem
+	list    list
+}
+
+func (p *menuPopup) update(msg tea.Msg) (bool, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return false, nil
+	}
+	switch k.String() {
+	case "esc", "q":
+		return true, nil
+	case "j", "down":
+		p.list.move(1, len(p.items))
+	case "k", "up":
+		p.list.move(-1, len(p.items))
+	case "enter":
+		return true, p.items[p.list.cursor].run()
+	default:
+		for _, it := range p.items {
+			if it.key == k.String() {
+				return true, it.run()
+			}
+		}
+	}
+	return false, nil
+}
+func (p *menuPopup) title() string { return p.heading }
+func (p *menuPopup) body(w int) []string {
+	lines := make([]string, len(p.items))
+	for i, it := range p.items {
+		lines[i] = fmt.Sprintf("%s  %-22s %s", style.Key.Render(it.key), it.label, style.Dim.Render(it.desc))
+	}
+	return p.list.render(lines, w, len(lines), true)
+}
+func (p *menuPopup) hint() string { return "enter / shortcut select · esc cancel" }
 
 // messagePopup shows text (errors, update results) until dismissed.
 type messagePopup struct {

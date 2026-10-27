@@ -59,10 +59,11 @@ func DiffLine(l svn.DiffLine) string {
 	case svn.LineHeader:
 		s = s.Bold(true)
 	}
-	return s.Render(expandTabs(l.Text))
+	return s.Render(ExpandTabs(l.Text))
 }
 
-func expandTabs(s string) string { return strings.ReplaceAll(s, "\t", "    ") }
+// ExpandTabs replaces tabs with four spaces so widths are predictable.
+func ExpandTabs(s string) string { return strings.ReplaceAll(s, "\t", "    ") }
 
 // Box draws a rounded border of exactly w×h cells with title set into the
 // top edge. Lines are clipped to fit; missing lines are padded.

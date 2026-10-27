@@ -152,7 +152,7 @@ func ParseStatus(data []byte) ([]FileStatus, error) {
 		}
 		return files[i].Path < files[j].Path
 	})
-	return files, nil
+	return hideConflictArtifacts(files), nil
 }
 
 // groupRank orders conflicts first, then versioned changes, then the rest.

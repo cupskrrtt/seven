@@ -63,6 +63,8 @@ type Model struct {
 	mainScroll  int
 	mainHScroll int
 
+	conflict *conflictView // non-nil while the hunk picker owns the main view
+
 	ignoreWhitespace bool
 	showCmdLog       bool
 	refreshEvery     time.Duration // status auto-refresh; 0 disables
@@ -146,6 +148,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case opDoneMsg:
 		m.status = msg.status
+		if m.conflict != nil {
+			m.reloadConflict() // e.g. after editing the file in $EDITOR
+		}
 		return m, m.refresh()
 
 	case errMsg:
@@ -171,9 +176,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.commitFromEditor(msg)
 	}
 
-	if m.popup != nil {
-		closed, cmd := m.popup.update(msg)
-		if closed {
+	if p := m.popup; p != nil {
+		closed, cmd := p.update(msg)
+		// The popup may have opened a follow-up popup (e.g. menu → confirm).
+		if closed && m.popup == p {
 			m.popup = nil
 		}
 		return m, cmd
@@ -289,12 +295,23 @@ func (m *Model) setFocus(p panel) tea.Cmd {
 	m.focus = p
 	if p != panelMain {
 		m.lastLeft = p
+		if m.conflict != nil {
+			m.conflict = nil
+			m.mainKey = "" // the file changed; reload its diff
+		}
 	}
 	return m.syncMain()
 }
 
 func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	key := k.String()
+
+	// The conflict picker takes precedence over global keys except quit/help.
+	if m.focus == panelMain && m.conflict != nil && key != "q" && key != "ctrl+c" && key != "?" {
+		if handled, cmd := m.handleConflictKey(key); handled {
+			return cmd
+		}
+	}
 
 	// Global keys.
 	switch key {
@@ -367,6 +384,9 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 		m.fileList.set(len(m.files)-1, len(m.files))
 		return m.syncMain()
 	case "enter":
+		if ok && f.Item == svn.ItemConflicted {
+			return m.openConflict(f)
+		}
 		if ok {
 			return m.setFocus(panelMain)
 		}
@@ -454,13 +474,7 @@ func (m *Model) handleFilesKey(key string) tea.Cmd {
 			m.status = f.Path + " is not conflicted"
 			return nil
 		}
-		m.popup = &confirmPopup{
-			heading: "Mark resolved",
-			text:    fmt.Sprintf("Mark %s as resolved using the current working file?", f.Path),
-			onYes: m.op(func(ctx context.Context) (string, error) {
-				return "Resolved " + f.Path, m.client.Resolve(ctx, "working", f.Path)
-			}),
-		}
+		m.resolveMenu(f)
 	case "e":
 		return m.openEditor(m.abs(f.Path))
 	}
@@ -709,6 +723,9 @@ func (m *Model) View() string {
 	)
 
 	right := m.mainBox(rw, m.mainHeight())
+	if m.conflict != nil {
+		right = m.conflictBox(rw, m.mainHeight())
+	}
 	if m.showCmdLog {
 		right = lipgloss.JoinVertical(lipgloss.Left, right, m.cmdLogBox(rw, m.cmdLogHeight()))
 	}
@@ -832,12 +849,14 @@ func (m *Model) cmdLogBox(w, h int) string {
 
 func (m *Model) bottomBar() string {
 	var hints string
-	switch m.focus {
-	case panelFiles:
+	switch {
+	case m.focus == panelMain && m.conflict != nil:
+		hints = "n/p next/prev conflict · m mine · t theirs · b both · B base · z undo · e edit · esc back"
+	case m.focus == panelFiles:
 		hints = "space select · c commit · a add · d revert · D rm · i ignore · R resolve · u update"
-	case panelLog:
+	case m.focus == panelLog:
 		hints = "enter view · j/k move · u update · U update to rev"
-	case panelMain:
+	case m.focus == panelMain:
 		hints = "j/k scroll · ctrl+d/u page · h/l pan · esc back"
 	default:
 		hints = "enter details · u update"
